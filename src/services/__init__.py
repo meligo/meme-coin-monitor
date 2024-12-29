@@ -1,1 +1,3 @@
-# Services package initialization
+"""
+Services package for meme coin monitoring
+"""

@@ -1,331 +1,450 @@
 import asyncio
+import base64
 import json
 import logging
-import websockets
-import base58
-import base64
-import struct
-from datetime import datetime
-from typing import Dict, Optional, List, Any
-from solders.pubkey import Pubkey
-from solana.rpc.async_api import AsyncClient
-from construct import Struct, Int64ul, Flag
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-# Local imports
-from config.settings import settings
-from config.database import get_db
-from core.models.meme_coin import MemeCoin
-from services.analysis.website_analyzer import website_analyzer
+import websockets
+from construct import Flag, Int8ul, Int64ul, Struct
+from solana.exceptions import SolanaRpcException
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Commitment
+from solana.rpc.types import MemcmpOpts
+from solders.pubkey import Pubkey
+
+from src.config.database import get_db
+from src.config.settings import settings
+from src.core.models.meme_coin import MemeCoin
 
 logger = logging.getLogger(__name__)
 
-class PumpFunScanner:
+class TokenProcessor:
+    """Handles asynchronous processing of token data"""
+    
     def __init__(self):
-        self.rpc_client = AsyncClient(settings.RPC_ENDPOINT)
-        
-        # Bonding curve state structure
-        self.BONDING_CURVE_STATE = Struct(
+        self.queue = asyncio.Queue()
+        self.processing = True
+        self._processing_task = None
+        self.processed_count = 0
+        self.error_count = 0
+        logger.info("Token processor initialized")
+
+    async def start(self):
+        """Start the token processor"""
+        self._processing_task = asyncio.create_task(self._process_queue())
+        logger.info("Token processor started")
+
+    async def stop(self):
+        """Stop the token processor"""
+        self.processing = False
+        if self._processing_task:
+            self._processing_task.cancel()
+            try:
+                await self._processing_task
+            except asyncio.CancelledError:
+                pass
+        logger.info(f"Token processor stopped. Processed: {self.processed_count}, Errors: {self.error_count}")
+
+    async def add_token(self, token_data: Dict):
+        """Add a token to the processing queue"""
+        if not isinstance(token_data, dict):
+            logger.error(f"Invalid token data type: {type(token_data)}")
+            return
+        await self.queue.put(token_data)
+        logger.debug(f"Added token to queue: {token_data.get('address')} (Queue size: {self.queue.qsize()})")
+
+    async def _process_queue(self):
+        """Process tokens from the queue"""
+        while self.processing:
+            try:
+                if self.queue.qsize() > 0:
+                    logger.debug(f"Current queue size: {self.queue.qsize()}")
+                
+                token_data = await self.queue.get()
+                await self._process_token(token_data)
+                self.queue.task_done()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error processing token from queue: {e}")
+                self.error_count += 1
+
+    async def _process_token(self, token_data: Dict):
+        """Process a single token"""
+        if not token_data:
+            logger.warning("⚠️ Received empty token data")
+            return
+
+        db = next(get_db())
+        try:
+            address = token_data.get('address')
+            if not address:
+                logger.error("❌ Token data missing address")
+                self.error_count += 1
+                return
+
+            # Log incoming token data
+            logger.info(f"💫 Processing: {token_data.get('name')} ({token_data.get('symbol')}) - {address}")
+
+            existing_token = db.query(MemeCoin).filter(
+                MemeCoin.address == address
+            ).first()
+            
+            if existing_token:
+                logger.info(f"📋 Token {token_data.get('name')} already exists in database")
+                return
+
+            meme_coin = MemeCoin(
+                address=address,
+                name=token_data.get('name', f"Unknown Token {address[:8]}"),
+                symbol=token_data.get('symbol', 'UNKNOWN'),
+                total_supply=token_data.get('total_supply', 0),
+                liquidity=token_data.get('liquidity', 0),
+                contract_analysis=token_data.get('contract_analysis', {}),
+                bonding_curve_address=token_data.get('bonding_curve'),
+                bonding_curve_state=token_data.get('curve_data', {}),
+                is_curve_complete=token_data.get('curve_complete', False),
+                launch_date=token_data.get('creation_date', datetime.now(timezone.utc))
+            )
+
+            db.add(meme_coin)
+            db.commit()
+            self.processed_count += 1
+            logger.info(f"✨ Added new token: {meme_coin.name} ({meme_coin.symbol}) - Total processed: {self.processed_count}")
+
+        except Exception as e:
+            db.rollback()
+            self.error_count += 1
+            logger.error(f"Error storing token {token_data.get('address')}: {e}")
+            logger.error(f"Token data that caused error: {json.dumps(token_data, indent=2, default=str)}")
+        finally:
+            db.close()
+
+class PumpFunScanner:
+    """Scanner for Pump.fun token operations"""
+
+    def __init__(self):
+        self.rpc_client = AsyncClient(settings.RPC_ENDPOINT, commitment=Commitment("confirmed"),timeout=30.0)
+        self.token_processor = TokenProcessor()
+        self.pump_program = Pubkey.from_string(settings.PUMP_PROGRAM)
+        self.metadata_program = Pubkey.from_string(settings.TOKEN_METADATA_PROGRAM_ID)
+        self.max_retries = 3
+        self.retry_delay = 2
+
+        # Token account state structure
+        self.TOKEN_STATE = Struct(
+            "discriminator" / Int64ul,
+            "version" / Int8ul,
+            "is_initialized" / Flag,
             "virtual_token_reserves" / Int64ul,
             "virtual_sol_reserves" / Int64ul,
             "real_token_reserves" / Int64ul,
             "real_sol_reserves" / Int64ul,
             "token_total_supply" / Int64ul,
-            "complete" / Flag
+            "curve_state" / Int8ul,
+            "is_frozen" / Flag
         )
-        
-        # Create instruction discriminator
-        self.CREATE_DISCRIMINATOR = struct.pack("<Q", 8576854823835016728)
-        
-        # Discriminator for bonding curve accounts
-        self.CURVE_DISCRIMINATOR = struct.pack("<Q", 6966180631402821399)
-        logger.info("PumpFunScanner initialized")
 
-    async def parse_token_creation(self, log_data: Dict) -> Optional[Dict]:
-        """Parse token creation data from program logs"""
-        try:
-            logs = log_data.get('logs', [])
-            for log in logs:
-                if "Program data:" in log:
-                    # Extract and decode program data
-                    program_data = log.split("Program data: ")[1]
-                    decoded_data = base64.b64decode(program_data)
-                    
-                    # Check if this is a create instruction
-                    if len(decoded_data) > 8 and decoded_data[:8] == self.CREATE_DISCRIMINATOR:
-                        return await self._parse_create_instruction(decoded_data[8:], log_data)
-            
-            return None
-        except Exception as e:
-            logger.error(f"Error parsing token creation: {str(e)}")
-            return None
+        # Discriminators
+        self.TOKEN_DISCRIMINATOR = settings.TOKEN_DISCRIMINATOR
+        self.CURVE_DISCRIMINATOR = settings.CURVE_DISCRIMINATOR
 
-    async def _parse_create_instruction(self, data: bytes, log_data: Dict) -> Optional[Dict]:
-        """Parse create instruction data"""
+        logger.info("PumpFunScanner initialized with 2024 configurations")
+
+    async def retry_with_backoff(self, func, *args, **kwargs) -> Any:
+        """Execute function with exponential backoff retry"""
+        for attempt in range(self.max_retries):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    raise
+                wait_time = self.retry_delay * (2 ** attempt)
+                logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+
+    async def scan_existing_tokens(self):
+        """Scan and analyze existing tokens"""
+        logger.info("Starting scan of existing tokens...")
         try:
-            # Parse string lengths and values
-            offset = 0
-            
-            # Parse name length and value
-            name_len = int.from_bytes(data[offset:offset+4], 'little')
-            offset += 4
-            name = data[offset:offset+name_len].decode('utf-8')
-            offset += name_len
-            
-            # Parse symbol length and value
-            symbol_len = int.from_bytes(data[offset:offset+4], 'little')
-            offset += 4
-            symbol = data[offset:offset+symbol_len].decode('utf-8')
-            offset += symbol_len
-            
-            # Parse URI length and value
-            uri_len = int.from_bytes(data[offset:offset+4], 'little')
-            offset += 4
-            uri = data[offset:offset+uri_len].decode('utf-8')
-            offset += uri_len
-            
-            # Parse mint address (32 bytes)
-            mint = base58.b58encode(data[offset:offset+32]).decode('utf-8')
-            offset += 32
-            
-            # Parse bonding curve address (32 bytes)
-            bonding_curve = base58.b58encode(data[offset:offset+32]).decode('utf-8')
-            offset += 32
-            
-            # Parse creator address (32 bytes)
-            creator = base58.b58encode(data[offset:offset+32]).decode('utf-8')
-            
-            # Get transaction signature
-            signature = log_data.get('signature')
-            
-            # Analyze the contract
-            contract_analysis = await self._analyze_contract(Pubkey.from_string(mint))
-            
-            return {
-                'address': mint,
-                'name': name,
-                'symbol': symbol,
-                'uri': uri,
-                'bonding_curve': bonding_curve,
-                'creator': creator,
-                'signature': signature,
-                'contract_analysis': contract_analysis,
-                'creation_date': datetime.utcnow()
-            }
-            
+            filters = [
+                MemcmpOpts(
+                    offset=0,
+                    bytes=self.TOKEN_DISCRIMINATOR
+                )
+            ]
+
+            response = await self.retry_with_backoff(
+                self.rpc_client.get_program_accounts,
+                self.pump_program,
+                encoding="base64",
+                commitment=Commitment("confirmed"),
+                filters=filters
+                )
+
+            if not response.value:
+                logger.info("No existing tokens found")
+                return
+
+            total_accounts = len(response.value)
+            logger.info(f"Found {total_accounts} token accounts")
+
+            processed = 0
+            for account in response.value:
+                try:
+                    result = await self._process_existing_token(account)
+                    if result:
+                        processed += 1
+                        if processed % 10 == 0:  # Log every 10 tokens
+                            logger.info(f"Processed {processed}/{total_accounts} tokens")
+                except Exception as e:
+                    logger.error(f"Error processing account: {e}")
+
+            logger.info(f"Completed processing {processed}/{total_accounts} tokens")
+
         except Exception as e:
-            logger.error(f"Error parsing create instruction: {str(e)}", exc_info=True)
-            return None
-        
-    async def start_monitoring(self):
-        """Start monitoring both new tokens and existing ones"""
-        logger.info("Starting token monitoring...")
-        try:
-            await asyncio.gather(
-                self.listen_for_new_tokens(),
-                self.scan_existing_tokens()
-            )
-        except Exception as e:
-            logger.error(f"Error in monitoring: {str(e)}", exc_info=True)
+            logger.error(f"Error scanning existing tokens: {e}")
             raise
-        
+
     async def listen_for_new_tokens(self):
-        """Listen for new token creations on pump.fun"""
+        """Listen for new token creations"""
         logger.info("Starting new token listener...")
+        retry_count = 0
+        
         while True:
             try:
-                async with websockets.connect(settings.WSS_ENDPOINT) as websocket:
+                ws_endpoint = settings.RPC_ENDPOINT.replace('https://', 'wss://')
+                async with websockets.connect(ws_endpoint) as websocket:
                     subscription = {
                         "jsonrpc": "2.0",
                         "id": 1,
-                        "method": "logsSubscribe",
+                        "method": "blockSubscribe",
                         "params": [
-                            {"mentions": [str(settings.PUMP_PROGRAM)]},
-                            {"commitment": "processed"}
+                            {"mentionsAccountOrProgram": str(self.pump_program)},
+                            {
+                                "commitment": "confirmed",
+                                "encoding": "base64",
+                                "showRewards": False,
+                                "transactionDetails": "full",
+                                "maxSupportedTransactionVersion": 0
+                            }
                         ]
                     }
+                    
                     await websocket.send(json.dumps(subscription))
                     logger.info("WebSocket subscription established")
+                    retry_count = 0
                     
                     while True:
                         try:
                             response = await websocket.recv()
-                            data = json.loads(response)
-                            
-                            if 'method' in data and data['method'] == 'logsNotification':
-                                log_data = data['params']['result']['value']
-                                
-                                if any("Program log: Instruction: Create" in log for log in log_data.get('logs', [])):
-                                    logger.info("New token creation detected")
-                                    token_data = await self.parse_token_creation(log_data)
-                                    if token_data:
-                                        await self.process_new_token(token_data)
-                                        
+                            await self._handle_websocket_message(response)
+                        except asyncio.CancelledError:
+                            raise
                         except Exception as e:
-                            logger.error(f"Error processing message: {e}")
+                            logger.error(f"Error processing WebSocket message: {e}")
                             continue
                             
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.error(f"WebSocket connection error: {e}")
-                await asyncio.sleep(5)
-                
-    async def scan_existing_tokens(self):
-        """Scan and analyze existing tokens on pump.fun"""
-        logger.info("Starting scan of existing tokens...")
-        try:
-            # Get all token accounts for the program
-            response = await self.rpc_client.get_program_accounts(
-                settings.PUMP_PROGRAM,
-                encoding="base64"
-            )
-            
-            logger.info(f"Found {len(response.value)} program accounts")
-            
-            for account in response.value:
-                try:
-                    # Check if this is a bonding curve account
-                    if len(account.account.data) > 8 and account.account.data[:8] == self.CURVE_DISCRIMINATOR:
-                        token_data = await self.analyze_token_account(account.pubkey)
-                        if token_data:
-                            await self.process_new_token(token_data)
-                except Exception as e:
-                    logger.error(f"Error processing account {account.pubkey}: {e}")
-                    
-        except Exception as e:
-            logger.error(f"Error scanning existing tokens: {e}")
+                retry_count += 1
+                wait_time = min(retry_count * 5, 30)
+                logger.error(f"WebSocket connection error (retry {retry_count}): {e}")
+                await asyncio.sleep(wait_time)
 
-    async def analyze_token_account(self, token_address: Pubkey) -> Optional[Dict]:
-        """Analyze a token account and gather all relevant information"""
+    async def _handle_websocket_message(self, message: str):
+        """Handle incoming WebSocket messages"""
         try:
-            logger.info(f"Analyzing token: {token_address}")
-            # Get token metadata
-            metadata = await self._get_token_metadata(token_address)
-            if not metadata:
-                return None
-                
-            # Get bonding curve data
-            curve_data = await self._get_bonding_curve_data(token_address)
-            if not curve_data:
-                return None
-                
-            # Check if mint authority is renounced
-            mint_authority = await self._check_mint_authority(token_address)
-            
-            return {
-                'address': str(token_address),
-                'name': metadata.get('name'),
-                'symbol': metadata.get('symbol'),
-                'mint_authority_renounced': mint_authority.get('renounced', False),
-                'mint_authority': mint_authority.get('authority'),
-                'total_supply': curve_data.get('token_total_supply'),
-                'liquidity': curve_data.get('real_sol_reserves'),
-                'curve_complete': curve_data.get('complete', False),
-                'contract_analysis': await self._analyze_contract(token_address),
-                'creation_date': datetime.utcnow()
-            }
-            
-        except Exception as e:
-            logger.error(f"Error analyzing token {token_address}: {e}")
-            return None
-
-    async def process_new_token(self, token_data: Dict):
-        """Process and store new token data"""
-        logger.info(f"Processing new token: {token_data.get('name')} ({token_data.get('symbol')})")
-        db = next(get_db())
-        try:
-            # Check if token already exists
-            existing_token = db.query(MemeCoin).filter(MemeCoin.address == token_data['address']).first()
-            if existing_token:
-                logger.info(f"Token {token_data['address']} already exists in database")
+            data = json.loads(message)
+            if data.get('method') != 'blockNotification':
                 return
 
-            # Create new MemeCoin instance
-            meme_coin = MemeCoin(
-                address=token_data['address'],
-                name=token_data['name'],
-                symbol=token_data['symbol'],
-                total_supply=token_data.get('total_supply', 0),
-                contract_analysis=token_data.get('contract_analysis', {}),
-                launch_date=token_data['creation_date']
+            block_data = data.get('params', {}).get('result', {}).get('value', {}).get('block', {})
+            transactions = block_data.get('transactions', [])
+
+            for tx in transactions:
+                if not isinstance(tx, dict):
+                    continue
+
+                if self._is_token_creation(tx):
+                    logger.info("New token creation detected")
+                    token_data = await self._process_transaction(tx)
+                    if token_data:
+                        await self.token_processor.add_token(token_data)
+
+        except Exception as e:
+            logger.error(f"Error handling WebSocket message: {e}")
+
+    def _is_token_creation(self, tx_data) -> bool:
+        """Check if transaction is a token creation"""
+        try:
+            # Handle Solders EncodedConfirmedTransactionWithStatusMeta object
+            log_messages = []
+            
+            if hasattr(tx_data, 'meta') and tx_data.meta:
+                # Access log_messages directly from the meta field
+                log_messages = tx_data.meta.log_messages if tx_data.meta.log_messages else []
+            
+            if not log_messages:
+                return False
+
+            # Debug logging
+            logger.debug(f"Analyzing logs: {log_messages}")
+
+            creation_patterns = {
+                "Program log: Instruction: Create",
+                "Program log: Initialize token",
+                "Program log: Creating new token",
+                "Program log: Token initialized"
+            }
+            validation_patterns = {
+                "Program log: Token mint:",
+                "Program log: Curve data:"
+            }
+
+            has_creation = any(any(cp in str(log) for cp in creation_patterns) for log in log_messages)
+            has_validation = any(any(vp in str(log) for vp in validation_patterns) for log in log_messages)
+
+            if has_creation and has_validation:
+                logger.debug("Transaction identified as token creation")
+                return True
+                
+            return False
+
+        except Exception as e:
+            logger.error(f"Error checking token creation: {str(e)}")
+            if hasattr(tx_data, 'meta'):
+                logger.debug(f"Transaction meta type: {type(tx_data.meta)}")
+                logger.debug(f"Transaction meta dir: {dir(tx_data.meta)}")
+            return False
+
+    async def _process_existing_token(self, account) -> Optional[str]:
+        """Process an existing token account"""
+        try:
+            data = base64.b64decode(account.account.data[0])
+            if len(data) < 8 or data[:8] != self.TOKEN_DISCRIMINATOR:
+                return None
+
+            token_data = await self.analyze_token_account(account.pubkey, data)
+            if token_data:
+                await self.token_processor.add_token(token_data)
+                return token_data['address']
+            return None
+
+        except Exception as e:
+            logger.error(f"Error processing existing token: {e}")
+            return None
+
+    async def _process_transaction(self, tx_data) -> Optional[Dict]:
+        """Process a transaction for token creation"""
+        try:
+            logger.info("🔍 Investigating new potential token transaction...") # Changed from debug
+            
+            # Handle Solders EncodedConfirmedTransactionWithStatusMeta object
+            if not hasattr(tx_data, 'meta') or not tx_data.meta:
+                return None
+
+            post_token_balances = tx_data.meta.post_token_balances if tx_data.meta.post_token_balances else []
+
+            for balance in post_token_balances:
+                # For Solders object, access mint directly
+                mint_address = balance.mint
+                if not mint_address:
+                    continue
+
+                logger.info(f"📝 Analyzing token: {mint_address}") # Changed from debug
+                pubkey = Pubkey.from_string(mint_address)
+                account_info = await self.retry_with_backoff(
+                    self.rpc_client.get_account_info,
+                    pubkey,
+                    commitment=Commitment("confirmed"),
+                    encoding="base64"
+                )
+
+                if not account_info.value:
+                    logger.debug(f"No account info found for {mint_address}")
+                    continue
+
+                data = base64.b64decode(account_info.value.data[0])
+                if len(data) < 8 or data[:8] != self.TOKEN_DISCRIMINATOR:
+                    logger.debug(f"Invalid token discriminator for {mint_address}")
+                    continue
+
+                token_data = await self.analyze_token_account(pubkey, data)
+                if token_data:
+                    logger.info(f"Successfully analyzed token: {mint_address}")
+                    return token_data
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error processing transaction: {e}")
+            if hasattr(tx_data, 'meta'):
+                logger.debug(f"Transaction meta type: {type(tx_data.meta)}")
+                logger.debug(f"Transaction meta dir: {dir(tx_data.meta)}")
+            return None
+
+    async def analyze_token_account(self, pubkey: Pubkey, data: bytes) -> Optional[Dict]:
+        """Analyze a token account and extract data"""
+        try:
+            logger.info(f"🔎 Analyzing token account: {pubkey}") # Changed from debug
+            token_state = self.TOKEN_STATE.parse(data)
+            token_info = await self._get_token_metadata(pubkey)
+            
+            token_data = {
+                'address': str(pubkey),
+                'name': token_info.get('name', f"Unknown Token {str(pubkey)[:8]}"),
+                'symbol': token_info.get('symbol', 'UNKNOWN'),
+                'curve_data': {
+                    'virtual_token_reserves': token_state.virtual_token_reserves,
+                    'virtual_sol_reserves': token_state.virtual_sol_reserves,
+                    'real_token_reserves': token_state.real_token_reserves,
+                    'real_sol_reserves': token_state.real_sol_reserves,
+                    'total_supply': token_state.token_total_supply
+                },
+                'is_frozen': token_state.is_frozen,
+                'version': token_state.version,
+                'curve_state': token_state.curve_state,
+                'creation_date': datetime.now(timezone.utc)
+            }
+            
+            logger.info(f"✅ Token Analysis Complete - {token_data['name']} ({token_data['symbol']})") # New line
+            return token_data
+
+        except Exception as e:
+            logger.error(f"Error getting token metadata: {e}")
+            return None
+
+    async def _get_token_metadata(self, token_address: Pubkey) -> Dict:
+        """Get token metadata from chain"""
+        try:
+            # Get metadata account
+            metadata_address = Pubkey.find_program_address(
+                [b"metadata", bytes(self.metadata_program), bytes(token_address)],
+                self.metadata_program
+            )[0]
+            
+            metadata_account = await self.retry_with_backoff(
+                self.rpc_client.get_account_info,
+                metadata_address,
+                commitment=Commitment("confirmed")
             )
             
-            # Add to database
-            db.add(meme_coin)
-            db.commit()
+            if metadata_account.value:
+                data = base64.b64decode(metadata_account.value.data[0])
+                metadata = {
+                    'name': data[32:64].decode('utf-8').strip('\x00'),
+                    'symbol': data[64:96].decode('utf-8').strip('\x00')
+                }
+                logger.debug(f"Retrieved metadata for {token_address}: {metadata}")
+                return metadata
             
-            logger.info(f"Successfully added token: {token_data['name']} ({token_data['symbol']})")
-            
-        except Exception as e:
-            db.rollback()
-            logger.error(f"Error storing token data: {e}")
-        finally:
-            db.close()
-
-    async def _check_mint_authority(self, token_address: Pubkey) -> Dict:
-        """Check if token's mint authority is renounced"""
-        try:
-            # Get mint info from token program
-            mint_info = await self.rpc_client.get_account_info(token_address)
-            
-            if not mint_info.value or not mint_info.value.data:
-                return {'renounced': False, 'authority': None}
-
-            # Parse mint authority from token account data
-            # Mint authority is at offset 0 in token account data
-            mint_authority_data = mint_info.value.data[:32]
-            mint_authority = str(Pubkey(mint_authority_data))
-            
-            # Check if authority is the zero address
-            is_renounced = mint_authority == str(Pubkey.default())
-            
-            return {
-                'renounced': is_renounced,
-                'authority': None if is_renounced else mint_authority
-            }
-            
-        except Exception as e:
-            logger.error(f"Error checking mint authority: {e}")
-            return {'renounced': False, 'authority': None}
-
-    async def _analyze_contract(self, token_address: Pubkey) -> Dict:
-        """Analyze token contract for potential risks/features"""
-        try:
-            # Get program data
-            program_info = await self.rpc_client.get_account_info(token_address)
-            
-            if not program_info.value or not program_info.value.data:
-                return {}
-            
-            analysis = {
-                'has_mint_function': False,
-                'has_freeze_authority': False,
-                'has_blacklist': False,
-                'is_upgradeable': False,
-                'special_features': [],
-                'risk_factors': []
-            }
-            
-            # Parse token account data
-            data = program_info.value.data
-            
-            # Check for freeze authority
-            if len(data) >= 44:  # Freeze authority is at offset 36
-                freeze_authority_data = data[36:44]
-                has_freeze = not all(b == 0 for b in freeze_authority_data)
-                analysis['has_freeze_authority'] = has_freeze
-                if has_freeze:
-                    analysis['risk_factors'].append('Has freeze authority')
-            
-            return analysis
-            
-        except Exception as e:
-            logger.error(f"Error analyzing contract: {e}")
+            logger.debug(f"No metadata found for {token_address}")
             return {}
 
-    def _get_bonding_curve_address(self, mint: Pubkey) -> tuple[Pubkey, int]:
-        """Get the bonding curve address for a token"""
-        return Pubkey.find_program_address(
-            [b"bonding-curve", bytes(mint)],
-            settings.PUMP_PROGRAM
-        )
-
-scanner = PumpFunScanner()
+        except Exception as e:
+            logger.error(f"Error getting token metadata: {e}")
+            return {}

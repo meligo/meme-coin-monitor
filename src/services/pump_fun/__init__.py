@@ -1,1 +1,3 @@
-# Pump.fun package initialization
+"""
+Pump.fun specific services
+"""

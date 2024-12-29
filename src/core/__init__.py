@@ -1,1 +1,3 @@
-# Core package initialization
+"""
+Core functionality package
+"""
