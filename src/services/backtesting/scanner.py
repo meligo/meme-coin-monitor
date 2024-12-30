@@ -19,7 +19,7 @@ class BacktestScanner(PumpFunScanner):
     def __init__(self, batch_size: int = 20):
         super().__init__()
         self.batch_size = batch_size
-        self.pump_program = Pubkey.from_string(settings.PUMP_PROGRAM)
+        self.pump_program = Pubkey.from_string(settings['PUMP_PROGRAM'])
         self.max_retries = 3
         self.retry_delay = 2
         self.processed_tokens = 0

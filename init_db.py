@@ -1,18 +1,20 @@
 import os
 import sys
-from sqlalchemy_utils import database_exists, create_database, drop_database
-from sqlalchemy import text, create_engine, MetaData, inspect
+
+from sqlalchemy import MetaData, create_engine, inspect, text
+from sqlalchemy_utils import create_database, database_exists, drop_database
 
 # Add the project root directory to the Python path
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(project_root)
 
-from src.config.settings import settings
 from src.config.database import engine
+from src.config.settings import settings
 from src.core.models import Base, MemeCoin  # Import all models
 
+
 def init_database():
-    print(f"Database URL: {settings.DATABASE_URL}")
+    print(f"Database URL: {settings['DATABASE_URL']}")
     print("\nInitializing database...")
     
     # Create database if it doesn't exist
