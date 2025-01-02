@@ -18,11 +18,21 @@ from solana.rpc.commitment import Commitment
 from solana.rpc.types import MemcmpOpts
 from solders.pubkey import Pubkey
 from solders.rpc.responses import GetProgramAccountsJsonParsedResp
+from sqlalchemy import select
 
-from src.config.database import get_db
+from src.config.database import get_async_session, get_db
 from src.config.settings import settings
 from src.core.models.meme_coin import MemeCoin
 from src.core.models.tier_models import TierAlert, TierTransition, TokenTier
+from src.core.models.wallet_analysis import WalletAnalysis, WalletTransaction
+from src.services.analysis.rug_detector import RugDetector
+from src.services.blockchain.token_metrics import TokenMetrics
+from src.services.holder_analysis.distribution_calculator import DistributionCalculator
+from src.services.holder_analysis.metrics_updater import HolderMetricsUpdater
+from src.services.monitoring.performance import (
+    MeasureBlockPerformance,
+    measure_performance,
+)
 from src.services.pump_fun.liquidity_checker import LiquidityChecker
 from src.services.tier_management import TierLevel, TierProcessor
 from src.services.tier_management.monitoring import TierMonitor  # Add this line
@@ -31,6 +41,9 @@ from src.services.tier_management.tier_manager import (
     TierManager,
 )
 from src.services.tier_management.utils.metrics import calculate_token_metrics
+from src.services.transaction_processing.processor import TransactionProcessor
+from src.services.wallet_analysis.analyzer import WalletPatternAnalyzer
+from src.utils.rate_limiter import GlobalRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +78,13 @@ class TokenProcessor:
         self.tier_processor = TierProcessor()
         self.tier_manager = TierManager()  # Add this line
         self.tier_monitor = TierMonitor()  # Add this line
+        self.wallet_analyzer = WalletPatternAnalyzer(self.rpc_client)  
+        self.rug_detector = RugDetector()
+        self.holder_metrics_updater = HolderMetricsUpdater()
+        self.distribution_calculator = DistributionCalculator()
+        self.transaction_processor = TransactionProcessor(self.rpc_client)
+        self.token_program_id = Pubkey.from_string(settings['SYSTEM_TOKEN_PROGRAM'])  # Add this line
+        self.rate_limiter = GlobalRateLimiter()
 
         logger.info("Token processor initialized with tier management")
 
@@ -141,161 +161,323 @@ class TokenProcessor:
         elif isinstance(config, list):
             return [self.convert_timedelta_to_seconds(item) for item in config]  # Fixed: x -> item
         return config
+    
+    async def _get_token_holders(self, token_address: str) -> List[Dict]:
+        """Get token holders using batched RPC calls and efficient filtering"""
+        try:
+            # Get largest accounts using rate limiter
+            largest_accounts = await self.rate_limiter.call(
+                self.rpc_client.get_token_largest_accounts,
+                Pubkey.from_string(token_address)
+            )
+            
+            if not largest_accounts or not largest_accounts.value:
+                return []
 
+            # Get accounts in batches for better performance
+            BATCH_SIZE = 100
+            all_holders = []
+            
+            batch_call = {
+                'func': self.rpc_client.get_program_accounts,
+                'args': [self.token_program_id],
+                'kwargs': {
+                    'commitment': Commitment("confirmed"),
+                    'encoding': "jsonParsed",
+                    'filters': [
+                        {
+                            "memcmp": {
+                                "bytes": token_address,
+                                "offset": 0
+                            },
+                            "dataSize": 165
+                        }
+                    ]
+                }
+            }
 
+            batch_accounts = await self.rate_limiter.call(**batch_call)
+            
+            if not batch_accounts or not batch_accounts.value:
+                return []
+                
+            # Process accounts
+            for account in batch_accounts.value:
+                if account.account.data.parsed:
+                    info = account.account.data.parsed['info']
+                    balance = int(info['tokenAmount']['amount'])
+                    
+                    if balance > 0:
+                        all_holders.append({
+                            'wallet': info['owner'],
+                            'balance': balance,
+                            'decimals': info['tokenAmount']['decimals']
+                        })
+
+            # Deduplicate and aggregate balances by wallet
+            wallet_balances = {}
+            for holder in all_holders:
+                wallet = holder['wallet']
+                if wallet in wallet_balances:
+                    wallet_balances[wallet]['balance'] += holder['balance']
+                else:
+                    wallet_balances[wallet] = holder
+
+            return list(wallet_balances.values())
+
+        except Exception as e:
+            logger.error(f"Error getting token holders: {e}")
+            return []
+        
+    async def _get_wallet_data(self, token_address: str) -> Dict:
+        """Get wallet transaction and holder data for analysis"""
+        async with get_async_session() as db:
+            try:
+                # Get holder data directly from blockchain/API using address
+                holders = await self._get_token_holders(token_address)
+                
+                # Get transaction history from DB using async session
+                result = await db.execute(
+                    select(WalletTransaction).where(
+                        WalletTransaction.token_address == token_address
+                    )
+                )
+                transactions = result.scalars().all()
+                
+                return {
+                    'holders': holders,
+                    'transactions': [tx.__dict__ for tx in transactions]
+                }
+            except Exception as e:
+                logger.error(f"Error getting wallet data for {token_address}: {e}")
+                return {'holders': [], 'transactions': []}
+            
     async def _process_token(self, token_data: Dict):
         """Process a single token"""
         if not token_data:
             logger.warning("⚠️ Received empty token data")
             return
 
-        db = next(get_db())
-        try:
-            address = token_data.get('address')
-            if not address:
-                logger.error("❌ Token data missing address")
+        async with get_async_session() as db:
+            try:
+                address = token_data.get('address')
+                if not address:
+                    logger.error("❌ Token data missing address")
+                    self.error_count += 1
+                    return
+
+                logger.info(f"💫 Processing: {token_data.get('name')} ({token_data.get('symbol')}) - {address}")
+
+                # Check if the token already exists in the database 
+                # Get real-time bonding curve data
+                mint = Pubkey.from_string(address)
+                logger.info("1. Getting bonding curve data...")
+                bonding_curve_address, _ = self.get_associated_bonding_curve_address(
+                    mint, 
+                    Pubkey.from_string(settings['PUMP_PROGRAM'])
+                )
+                curve_state = await self.get_bonding_curve_state(bonding_curve_address)
+                if not curve_state:
+                    logger.error(f"❌ Could not get curve state for {address}")
+                    return
+                
+                # Log incoming token data
+                # Check if token exists
+                result = await db.execute(
+                    select(MemeCoin).where(MemeCoin.address == address)
+                )
+                existing_token = result.scalar_one_or_none()
+                
+                if existing_token:
+                    logger.info(f"📋 Token {token_data.get('name')} already exists in database")
+                    await self._update_existing_token(existing_token, token_data, curve_state)
+                    return
+                    
+                logger.info("3. checking marketcap for token...")
+                metrics = await self.token_metrics.get_all_metrics(
+                    address,
+                    curve_state
+                )
+                market_cap = metrics['market_cap_usd']
+                
+                logger.info("4. checking tokens left for token...")
+                tokens_left = self.calculate_tokens_left(
+                    curve_state.token_total_supply,
+                    curve_state.real_token_reserves
+                )
+                
+                logger.info("5. checking completion progress for token...")
+                completion_progress = self.calculate_completion_progress(market_cap)
+                
+                logger.info("6. checking koth progress for token...")
+                koth_progress = self.calculate_koth_progress(market_cap)
+                
+                logger.info("7. checking liquidity for token...")
+                liquidity_info = await self.liquidity_checker.check_liquidity(
+                    address,
+                    str(bonding_curve_address)
+                )
+
+                # Current state for rug detection
+                current_state = {
+                    'liquidity': liquidity_info.get('current_liquidity', 0.0),
+                    'volume_24h': token_data.get('volume_24h', 0),
+                    'holder_count': token_data.get('holder_count', 0),
+                    'smart_money_flow': token_data.get('smart_money_flow', 0),
+                    'market_cap_usd': market_cap,
+                    'tokens_left': tokens_left
+                }
+                
+                # Run rug detection if we have historical data
+                risk_score = 0.0
+                alerts = []
+                risk_factors = {}
+                
+                if existing_token:
+                    historical_state = {
+                        'liquidity': existing_token.liquidity,
+                        'volume_24h': existing_token.volume_24h_usd,
+                        'holder_count': existing_token.holder_count,
+                        'smart_money_flow': existing_token.smart_money_flow,
+                        'market_cap_usd': existing_token.market_cap_usd
+                    }
+                    
+                    risk_score, alerts, risk_factors = await self.rug_detector.analyze_token(
+                        current_state,
+                        historical_state
+                    )
+
+                # Create the base token
+                meme_coin = MemeCoin(
+                    address=address,
+                    name=token_data.get('name', f"Unknown Token {address[:8]}"),
+                    symbol=token_data.get('symbol', 'UNKNOWN'),
+                    total_supply=curve_state.token_total_supply if curve_state else 0,
+                    contract_analysis=token_data.get('contract_analysis', {}),
+                    bonding_curve_address=str(bonding_curve_address),
+                    bonding_curve_state={
+                        'virtual_token_reserves': curve_state.virtual_token_reserves,
+                        'virtual_sol_reserves': curve_state.virtual_sol_reserves,
+                        'real_token_reserves': curve_state.real_token_reserves,
+                        'real_sol_reserves': curve_state.real_sol_reserves,
+                        'token_total_supply': curve_state.token_total_supply
+                    } if curve_state else {},
+                    is_curve_complete=curve_state.complete if curve_state else False,
+                    launch_date=token_data.get('creation_date', datetime.now(timezone.utc)),
+                    tokens_left=tokens_left,
+                    market_cap_usd=market_cap,
+                    bonding_curve_completion=completion_progress,
+                    king_of_hill_progress=koth_progress,
+                    liquidity=liquidity_info.get('current_liquidity', 0.0),
+                    price_usd=market_cap / (10**9) if market_cap > 0 else 0,  # Assuming 9 decimals
+                    volume_24h_usd=token_data.get('volume_24h', 0),
+                    holder_count=token_data.get('holder_count', 0),
+                    risk_score=risk_score,
+                    whale_holdings=token_data.get('whale_holdings', 0.0),
+                    smart_money_flow=token_data.get('smart_money_flow', 0.0)
+                )
+                
+                await db.add(meme_coin)
+                await db.flush()
+
+                # Create tier metrics
+                initial_metrics = {
+                    'market_cap_usd': market_cap,
+                    'liquidity': liquidity_info.get('current_liquidity', 0.0),
+                    'volume_24h': token_data.get('volume_24h', 0),
+                    'holder_count': token_data.get('holder_count', 0),
+                    'age': 0
+                }
+                
+                # Get tier level and monitoring config
+                tier_level = await self.tier_manager.assign_initial_tier(initial_metrics)
+                monitoring_config = self.tier_manager.get_monitoring_config(tier_level)
+                monitoring_config = self.convert_timedelta_to_seconds(monitoring_config)
+
+                # Convert timedelta in tier_metrics
+                tier_metrics = initial_metrics.copy()
+                if 'age' in tier_metrics and isinstance(tier_metrics['age'], timedelta):
+                    tier_metrics['age'] = int(tier_metrics['age'].total_seconds())
+                
+                # Create token tier
+                token_tier = TokenTier(
+                    token_id=meme_coin.id,
+                    token_address=address,
+                    current_tier=tier_level,
+                    tier_updated_at=datetime.utcnow(),
+                    last_checked=datetime.utcnow(),
+                    check_frequency=monitoring_config['check_frequency'],
+                    next_check_at=datetime.utcnow() + timedelta(
+                        seconds=monitoring_config['check_frequency']
+                    ),
+                    tier_metrics=tier_metrics,
+                    monitoring_config=monitoring_config,
+                    processing_priority=self._calculate_priority(tier_level, initial_metrics),
+                    is_active=True,
+                    is_monitoring_paused=False,
+                    alert_count=len(alerts) if alerts else 0
+                )
+                
+                # Get and analyze wallet data
+                wallet_data = await self._get_wallet_data(token_data['address'])
+                risk_score, analysis_data = await self.wallet_analyzer.analyze_wallet_patterns(
+                    token_address=token_data['address'],
+                    current_mcap=token_data.get('market_cap_usd', 0),
+                    holder_data=wallet_data['holders'],
+                    transaction_history=wallet_data['transactions']
+                )
+
+                # Create wallet analysis record
+                wallet_analysis = WalletAnalysis(
+                    token_id=meme_coin.id,
+                    risk_score=risk_score,
+                    early_entries=analysis_data.get('early_entries', []),  # Add default empty list
+                    wallet_clusters=analysis_data.get('wallet_clusters', []),
+                    coordinated_actions=analysis_data.get('coordinated_actions', []),
+                    high_risk_wallets=analysis_data.get('high_risk_wallets', [])
+                )
+                
+                # Get and process holder data
+                holders = await self._get_token_holders(token_data['address'])
+                
+                # Update holder metrics using the new service
+                await self.holder_metrics_updater.update_holder_metrics(
+                    db=db,
+                    token_address=token_data['address'],
+                    holders=holders
+                )
+
+                # Process transactions using the new service
+                await self.transaction_processor.process_transactions(
+                    token_address=token_data['address']
+                )
+
+
+                # Add records to database
+                await db.add(wallet_analysis)
+                await db.add(token_tier)
+                await db.commit()
+                await db.refresh(meme_coin)
+                await db.refresh(token_tier)
+                
+                # Start monitoring
+                await self._start_tier_monitoring(meme_coin)
+
+                self.processed_count += 1
+                logger.info(f"✨ Added new token: {meme_coin.name} ({meme_coin.symbol}) - Total processed: {self.processed_count}")
+                logger.info(f"✨ Added token: {meme_coin.name} ({meme_coin.symbol}) - "
+                        f"Market Cap: ${market_cap:.2f}, "
+                        f"Completion: {completion_progress:.1f}%, "
+                        f"KOTH: {koth_progress:.1f}%")
+
+            except Exception as e:
+                await db.rollback()
                 self.error_count += 1
-                return
-
-            logger.info(f"💫 Processing: {token_data.get('name')} ({token_data.get('symbol')}) - {address}")
-
-            # Check if the token already exists in the database 
-            # Get real-time bonding curve data
-            mint = Pubkey.from_string(address)
-            logger.info("1. Getting bonding curve data...")
-            bonding_curve_address, _ = self.get_associated_bonding_curve_address(
-                mint, 
-                Pubkey.from_string(settings['PUMP_PROGRAM'])
-            )
-            curve_state = await self.get_bonding_curve_state(bonding_curve_address)
-
-            # Log incoming token data
-            logger.info("2. check if existing token...")
-            existing_token = db.query(MemeCoin).filter(
-                MemeCoin.address == address
-            ).first()
-            
-            if existing_token:
-                logger.info(f"📋 Token {token_data.get('name')} already exists in database")
-                # Update existing token's tier if needed
-                await self._update_token_tier(existing_token, token_data)
-                return
-            logger.info("3. checking marketcap for token...")
-            market_cap = self.calculate_market_cap(
-                curve_state.real_sol_reserves,
-                curve_state.real_token_reserves
-            )
-            logger.info("4. checking tokens left for token...")
-            tokens_left = self.calculate_tokens_left(
-                curve_state.token_total_supply,
-                curve_state.real_token_reserves
-            )
-            logger.info("5. checking completion progress for token...")
-            completion_progress = self.calculate_completion_progress(market_cap)
-            
-            logger.info("6. checking koth progress for token...")
-            koth_progress = self.calculate_koth_progress(market_cap)
-            
-            logger.info("7. checking liquidity for token...")
-            liquidity_info = await self.liquidity_checker.check_liquidity(
-                address,
-                str(bonding_curve_address)
-            )
-
-             # Create the base token
-            meme_coin = MemeCoin(
-                address=address,
-                name=token_data.get('name', f"Unknown Token {address[:8]}"),
-                symbol=token_data.get('symbol', 'UNKNOWN'),
-                total_supply=curve_state.token_total_supply if curve_state else 0,
-                contract_analysis=token_data.get('contract_analysis', {}),
-                bonding_curve_address=str(bonding_curve_address),
-                bonding_curve_state={
-                    'virtual_token_reserves': curve_state.virtual_token_reserves,
-                    'virtual_sol_reserves': curve_state.virtual_sol_reserves,
-                    'real_token_reserves': curve_state.real_token_reserves,
-                    'real_sol_reserves': curve_state.real_sol_reserves,
-                    'token_total_supply': curve_state.token_total_supply
-                } if curve_state else {},
-                is_curve_complete=curve_state.complete if curve_state else False,
-                launch_date=token_data.get('creation_date', datetime.now(timezone.utc)),
-                tokens_left=tokens_left,
-                market_cap_usd=market_cap,
-                bonding_curve_completion=completion_progress,
-                king_of_hill_progress=koth_progress,
-                liquidity=liquidity_info.get('current_liquidity', 0.0),  # Keep only this liquidity parameter
-                price_usd=market_cap / (10**9) if market_cap > 0 else 0,  # Assuming 9 decimals
-                volume_24h_usd=0,  # Will be updated by volume tracker
-                holder_count=0,  # Will be updated by holder tracker
-                risk_score=0.0,  # Will be calculated by risk analyzer
-                whale_holdings=0.0,  # Will be updated by whale tracker
-                smart_money_flow=0.0  # Will be updated by smart money tracker
-            )
-            
-            db.add(meme_coin)
-            db.flush() 
-            # 2. Now create the tier data with the token ID
-            initial_metrics = {
-                'market_cap_usd': market_cap,
-                'liquidity': liquidity_info.get('current_liquidity', 0.0),
-                'holder_count': 0,
-                'volume_24h': 0,
-                'age': 0
-            }
-            
-            # 3. Create tier entry
-            tier_level = await self.tier_manager.assign_initial_tier(initial_metrics)
-            monitoring_config = self.tier_manager.get_monitoring_config(tier_level)
-            monitoring_config = self.convert_timedelta_to_seconds(monitoring_config)
-
-            # Convert any timedelta in tier_metrics
-            tier_metrics = initial_metrics.copy()
-            if 'age' in tier_metrics and isinstance(tier_metrics['age'], timedelta):
-                tier_metrics['age'] = int(tier_metrics['age'].total_seconds())
-                
-                
-            
-            token_tier = TokenTier(
-                token_id=meme_coin.id,
-                token_address=address,
-                current_tier=tier_level,
-                tier_updated_at=datetime.utcnow(),
-                last_checked=datetime.utcnow(),
-                check_frequency=monitoring_config['check_frequency'],
-                next_check_at=datetime.utcnow() + timedelta(
-                    seconds=monitoring_config['check_frequency']
-                ),
-                tier_metrics=tier_metrics,  # Use converted metrics
-                monitoring_config=monitoring_config,  # Use converted config
-                processing_priority=self._calculate_priority(tier_level, initial_metrics),
-                is_active=True,
-                is_monitoring_paused=False,
-                alert_count=0
-            )
-
-            # Add tier and commit all changes
-            db.add(token_tier)
-            db.commit()
-            db.refresh(meme_coin)
-            db.refresh(token_tier)
-
-            
-            # Start monitoring based on tier
-            await self._start_tier_monitoring(meme_coin)
-
-            self.processed_count += 1
-            logger.info(f"✨ Added new token: {meme_coin.name} ({meme_coin.symbol}) - Total processed: {self.processed_count}")
-            logger.info(f"✨ Added token: {meme_coin.name} ({meme_coin.symbol}) - "
-                       f"Market Cap: ${market_cap:.2f}, "
-                       f"Completion: {completion_progress:.1f}%, "
-                       f"KOTH: {koth_progress:.1f}%")
-        except Exception as e:
-            db.rollback()
-            self.error_count += 1
-            logger.error(f"Error storing token {token_data.get('address')}: {e}")
-            logger.error(f"Token data that caused error: {json.dumps(token_data, indent=2, default=str)}")
-        finally:
-            db.close()
+                logger.error(f"Error storing token {token_data.get('address')}: {e}")
+                logger.error(f"Token data that caused error: {json.dumps(token_data, indent=2, default=str)}")
+                logger.exception(e)
+            finally:
+                await db.close()
 
     def _calculate_priority(self, tier_level: TierLevel, metrics: Dict[str, Any]) -> int:
         """Calculate processing priority (1-100)"""
@@ -317,7 +499,93 @@ class TokenProcessor:
         except Exception as e:
             logger.error(f"Error calculating priority: {e}")
             return 50  # Default middle priority
+        
+    async def _update_existing_token(self, existing_token: MemeCoin, token_data: Dict, curve_state: BondingCurveState):
+        """Update an existing token with new data"""
+        async with get_async_session() as db:
+            try:
+                # Calculate new metrics
+                market_cap = self.calculate_market_cap(
+                    curve_state.real_sol_reserves,
+                    curve_state.real_token_reserves
+                )
+                
+                tokens_left = self.calculate_tokens_left(
+                    curve_state.token_total_supply,
+                    curve_state.real_token_reserves
+                )
+                
+                completion_progress = self.calculate_completion_progress(market_cap)
+                koth_progress = self.calculate_koth_progress(market_cap)
+                
+                # Get liquidity info
+                liquidity_info = await self.liquidity_checker.check_liquidity(
+                    token_data['address'],
+                    str(existing_token.bonding_curve_address)
+                )
+                
+                # Get current state for rug detection
+                current_state = {
+                    'liquidity': liquidity_info.get('current_liquidity', 0.0),
+                    'volume_24h': token_data.get('volume_24h', 0),
+                    'holder_count': token_data.get('holder_count', 0),
+                    'smart_money_flow': token_data.get('smart_money_flow', 0),
+                    'market_cap_usd': market_cap,
+                    'tokens_left': tokens_left
+                }
+                
+                historical_state = {
+                    'liquidity': existing_token.liquidity,
+                    'volume_24h': existing_token.volume_24h_usd,
+                    'holder_count': existing_token.holder_count,
+                    'smart_money_flow': existing_token.smart_money_flow,
+                    'market_cap_usd': existing_token.market_cap_usd
+                }
+                
+                risk_score, alerts, risk_factors = await self.rug_detector.analyze_token(
+                    current_state,
+                    historical_state
+                )
 
+                # Update token metrics
+                existing_token.bonding_curve_state = {
+                    'virtual_token_reserves': curve_state.virtual_token_reserves,
+                    'virtual_sol_reserves': curve_state.virtual_sol_reserves,
+                    'real_token_reserves': curve_state.real_token_reserves,
+                    'real_sol_reserves': curve_state.real_sol_reserves,
+                    'token_total_supply': curve_state.token_total_supply
+                }
+                existing_token.is_curve_complete = curve_state.complete
+                existing_token.tokens_left = tokens_left
+                existing_token.market_cap_usd = market_cap
+                existing_token.bonding_curve_completion = completion_progress
+                existing_token.king_of_hill_progress = koth_progress
+                existing_token.liquidity = liquidity_info.get('current_liquidity', 0.0)
+                existing_token.price_usd = market_cap / (10**9) if market_cap > 0 else 0
+                existing_token.risk_score = risk_score
+                existing_token.whale_holdings = token_data.get('whale_holdings', 0.0)
+                existing_token.smart_money_flow = token_data.get('smart_money_flow', 0.0)
+                
+                # Update holder metrics
+                holders = await self._get_token_holders(token_data['address'])
+                await self.holder_metrics_updater.update_holder_metrics(
+                    db=db,
+                    token_address=token_data['address'],
+                    holders=holders
+                )
+
+                # Process any new transactions
+                await self.transaction_processor.process_transactions(
+                    token_address=token_data['address']
+                )
+
+                await db.commit()
+                logger.info(f"Updated token: {existing_token.name} ({existing_token.symbol})")
+
+            except Exception as e:
+                await db.rollback()
+                logger.error(f"Error updating token {token_data.get('address')}: {e}")
+                raise
     async def _initialize_token_tier(self, meme_coin, token_data):
         """Initialize tier monitoring for a new token with complete metrics integration"""
         
@@ -517,7 +785,10 @@ class TokenProcessor:
     async def get_bonding_curve_state(self, curve_address: Pubkey) -> Optional[BondingCurveState]:
         """Get the bonding curve state for a given curve address"""
         try:
-            response = await self.rpc_client.get_account_info(curve_address)
+            response = await self.rate_limiter.call(
+                self.rpc_client.get_account_info,
+                curve_address
+            )
             if not response.value or not response.value.data:
                 logger.warning(f"No data found for bonding curve: {curve_address}")
                 return None
@@ -557,6 +828,8 @@ class PumpFunScanner:
     def __init__(self):
         self.rpc_client = AsyncClient(settings['RPC_ENDPOINT'], commitment=Commitment("confirmed"),timeout=30.0)
         self.token_processor = TokenProcessor()
+        self.token_metrics = TokenMetrics(self.rpc_client)
+        self.rate_limiter = GlobalRateLimiter()
         self.pump_program = Pubkey.from_string(settings['PUMP_PROGRAM'])
         self.metadata_program = Pubkey.from_string(settings['TOKEN_METADATA_PROGRAM_ID'])
         self.max_retries = 3
@@ -583,6 +856,22 @@ class PumpFunScanner:
 
         logger.info("PumpFunScanner initialized with 2024 configurations")
         
+    async def stop(self):
+        """Stop the scanner and cleanup resources"""
+        try:
+            # Stop token processor
+            if hasattr(self, 'token_processor'):
+                await self.token_processor.stop()
+                
+            # Close RPC client
+            if hasattr(self, 'rpc_client'):
+                await self.rpc_client.close()
+                
+            logger.info("PumpFunScanner stopped successfully")
+            
+        except Exception as e:
+            logger.error(f"Error stopping PumpFunScanner: {e}")
+            raise
         
     def _validate_token_field(self, field: str, value: str) -> bool:
         """Validate token fields for suspicious patterns."""
@@ -721,7 +1010,7 @@ class PumpFunScanner:
 
             # Use proper error handling for the response
             try:
-                response = await self.retry_with_backoff(
+                response = await self.rate_limiter.call(
                     self.rpc_client.get_program_accounts,
                     self.pump_program,
                     encoding="base64",
@@ -786,7 +1075,7 @@ class PumpFunScanner:
             logger.error(f"Error processing new token: {e}")
 
     async def listen_for_new_tokens(self):
-        """Listen for new token creations"""
+        """Listen for new token creations with rate limiting"""
         logger.info("Starting new token listener...")
         
         subscription = {
@@ -795,7 +1084,7 @@ class PumpFunScanner:
             "method": "logsSubscribe",
             "params": [
                 {"mentions": [str(self.pump_program)]},
-                {"commitment": "confirmed"}  # Changed from processed
+                {"commitment": "confirmed"}
             ]
         }
         
@@ -808,30 +1097,37 @@ class PumpFunScanner:
                     
                     while True:
                         response = await websocket.recv()
-                        data = json.loads(response)
                         
-                        if 'method' in data and data['method'] == 'logsNotification':
-                            log_data = data['params']['result']['value']
-                            logs = log_data.get('logs', [])
-                            
-                            if any("Program log: Instruction: Create" in log for log in logs):
-                                for log in logs:
-                                    if "Program data:" in log:
-                                        try:
-                                            encoded_data = log.split(": ")[1]
-                                            decoded_data = base64.b64decode(encoded_data)
-                                            parsed_data = self.parse_create_instruction(decoded_data)
-                                            if parsed_data:
-                                                logger.info(f"New token detected: {parsed_data['name']} ({parsed_data['symbol']})")
-                                                await self._process_new_token(parsed_data)
-                                        except Exception as e:
-                                            logger.error(f"Failed to decode log: {e}")
-                                            
+                        # Rate limit the message processing
+                        await self.rate_limiter.call(
+                            self._process_ws_message,
+                            json.loads(response)
+                        )
+                        
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.error(f"WebSocket connection error: {e}")
                 await asyncio.sleep(5)
+
+    async def _process_ws_message(self, data):
+        """Process websocket message with rate limiting"""
+        if 'method' in data and data['method'] == 'logsNotification':
+            log_data = data['params']['result']['value']
+            logs = log_data.get('logs', [])
+            
+            if any("Program log: Instruction: Create" in log for log in logs):
+                for log in logs:
+                    if "Program data:" in log:
+                        try:
+                            encoded_data = log.split(": ")[1]
+                            decoded_data = base64.b64decode(encoded_data)
+                            parsed_data = self.parse_create_instruction(decoded_data)
+                            if parsed_data:
+                                logger.info(f"New token detected: {parsed_data['name']} ({parsed_data['symbol']})")
+                                await self._process_new_token(parsed_data)
+                        except Exception as e:
+                            logger.error(f"Failed to decode log: {e}")
 
 
     async def _handle_websocket_message(self, message: str):
@@ -1000,13 +1296,12 @@ class PumpFunScanner:
     async def _get_token_metadata(self, token_address: Pubkey) -> Dict:
         """Get token metadata from chain"""
         try:
-            # Get metadata account
             metadata_address = Pubkey.find_program_address(
                 [b"metadata", bytes(self.metadata_program), bytes(token_address)],
                 self.metadata_program
             )[0]
             
-            metadata_account = await self.retry_with_backoff(
+            metadata_account = await self.rate_limiter.call(
                 self.rpc_client.get_account_info,
                 metadata_address,
                 commitment=Commitment("confirmed")

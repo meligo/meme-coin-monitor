@@ -20,7 +20,8 @@ class TierManager:
             TierLevel.HOT: 60,        # 1 minute
             TierLevel.WARM: 1800,     # 30 minutes
             TierLevel.COLD: 21600,    # 6 hours
-            TierLevel.ARCHIVE: 0      # No active monitoring
+            TierLevel.ARCHIVE: 0,      # No active monitoring
+            TierLevel.RUGGED: 0       # No active monitoring
         }
 
     def _init_resource_allocations(self):
@@ -29,7 +30,9 @@ class TierManager:
             TierLevel.SIGNAL: 0.30,   # 30%
             TierLevel.HOT: 0.40,      # 40%
             TierLevel.WARM: 0.20,     # 20%
-            TierLevel.COLD: 0.10      # 10%
+            TierLevel.COLD: 0.10,      # 10%
+            TierLevel.RUGGED: 0.0     # No resources allocated
+
         }
 
     def _init_thresholds(self):
@@ -62,6 +65,13 @@ class TierManager:
             'min_liquidity': 100,      # Minimum USD liquidity
             'min_volume_24h': 1000,    # Minimum 24h volume
             'max_concentration': 0.90   # Maximum holder concentration
+        }
+        
+        self.rug_thresholds = {
+            'liquidity_drop': 0.7,     # 70% liquidity drop
+            'volume_spike': 5.0,       # 5x volume spike
+            'holder_drop': 0.3,        # 30% holder decrease
+            'smart_money_outflow': 0.4 # 40% smart money leaving
         }
 
     async def assign_initial_tier(self, token_data: Dict[str, Any]) -> TierLevel:
@@ -154,6 +164,40 @@ class TierManager:
             logger.error(f"Error checking archive conditions: {e}")
             return False
 
+
+    async def check_for_rug(self, token_data: Dict[str, Any]) -> bool:
+        """Check if token shows signs of being rugged"""
+        try:
+            # Check liquidity drop
+            liquidity_change = token_data.get('liquidity_change_percent', 0)
+            if abs(liquidity_change) >= self.rug_thresholds['liquidity_drop']:
+                logger.warning(f"Severe liquidity drop detected: {liquidity_change:.2f}%")
+                return True
+                
+            # Check volume spike
+            volume_change = token_data.get('volume_change_percent', 0)
+            if volume_change >= self.rug_thresholds['volume_spike']:
+                logger.warning(f"Suspicious volume spike detected: {volume_change:.2f}x")
+                return True
+                
+            # Check holder decrease
+            holder_change = token_data.get('holder_change_percent', 0)
+            if abs(holder_change) >= self.rug_thresholds['holder_drop']:
+                logger.warning(f"Rapid holder decrease detected: {holder_change:.2f}%")
+                return True
+                
+            # Check smart money outflow
+            smart_money_flow = token_data.get('smart_money_flow', 0)
+            if smart_money_flow <= -self.rug_thresholds['smart_money_outflow']:
+                logger.warning(f"Smart money outflow detected: {smart_money_flow:.2f}")
+                return True
+                
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking for rug: {e}")
+            return False
+
     async def update_tier(self, current_tier: TierLevel, token_data: Dict[str, Any]) -> TierLevel:
         """
         Update token tier based on current metrics and conditions
@@ -166,6 +210,12 @@ class TierManager:
             TierLevel: Updated tier for the token
         """
         try:
+            # Check for rug pull first
+            if await self.check_for_rug(token_data):
+                return TierLevel.RUGGED
+            # Skip other checks if already rugged
+            if current_tier == TierLevel.RUGGED:
+                return TierLevel.RUGGED
             # Check for archive conditions first
             if await self.should_archive(token_data):
                 return TierLevel.ARCHIVE
@@ -207,14 +257,15 @@ class TierManager:
             TierLevel.HOT: 'high',
             TierLevel.WARM: 'medium',
             TierLevel.COLD: 'low',
-            TierLevel.ARCHIVE: 'none'
+            TierLevel.ARCHIVE: 'none',
+            TierLevel.RUGGED: 'none'
         }
 
         base_config = {
             'check_frequency': self.check_frequencies[tier],
             'resource_allocation': self.resource_allocation.get(tier, 0),
             'monitoring_priority': priorities[tier],
-            'alert_enabled': tier != TierLevel.ARCHIVE
+            'alert_enabled': tier not in [TierLevel.ARCHIVE, TierLevel.RUGGED]
         }
 
         # Add tier-specific thresholds
@@ -223,6 +274,8 @@ class TierManager:
             base_config['cache_history'] = True
         elif tier in self.tier_thresholds:
             base_config['alert_thresholds'] = self.tier_thresholds[tier]
+        elif tier == TierLevel.RUGGED:
+            base_config['alert_thresholds'] = self.rug_thresholds
 
         return base_config
 

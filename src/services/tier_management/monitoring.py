@@ -245,17 +245,6 @@ class TierMonitor:
             logger.error(f"Error monitoring cold tier: {e}")
             return {'error': str(e)}
 
-    async def _get_current_metrics(self, token: MemeCoin) -> Dict[str, Any]:
-        """Get current token metrics"""
-        return {
-            'liquidity': token.liquidity,
-            'market_cap_usd': token.market_cap_usd,
-            'volume_24h_usd': token.volume_24h_usd,
-            'holder_count': token.holder_count,
-            'whale_movement': self._calculate_whale_movement(token),
-            'holder_concentration': self._calculate_holder_concentration(token),
-            'daily_transactions': self._get_daily_transactions(token)
-        }
 
     async def _get_historical_metrics(self, db: Session, token: MemeCoin) -> Dict[str, Any]:
         """

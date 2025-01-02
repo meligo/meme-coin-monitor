@@ -86,6 +86,8 @@ class MemeCoin(Base):
     holder_snapshots = relationship("HolderSnapshot", back_populates="token")
     trading_volumes = relationship("TradingVolume", back_populates="token")
     token_metadata = relationship("TokenMetadata", back_populates="token", uselist=False)
+    wallet_analyses = relationship("WalletAnalysis", back_populates="token")
+    transactions = relationship("WalletTransaction", back_populates="meme_coin")
 
     __table_args__ = {'comment': 'Main table storing meme coin information and metrics'}
 

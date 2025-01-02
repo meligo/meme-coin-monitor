@@ -1,8 +1,12 @@
 from enum import Enum
 
-class TierLevel(Enum):
-    SIGNAL = "signal"  # Potential pump detection
-    HOT = "hot"       # New tokens (0-7 days)
-    WARM = "warm"     # Established tokens (7-30 days)
-    COLD = "cold"     # Mature tokens (30+ days)
-    ARCHIVE = "archive"  # Inactive/rugged tokens
+class TierLevel(str, Enum):
+    SIGNAL = "SIGNAL"     # High potential/risk tokens
+    HOT = "HOT"          # New active tokens
+    WARM = "WARM"        # Established tokens
+    COLD = "COLD"        # Mature tokens
+    ARCHIVE = "ARCHIVE"  # Inactive tokens
+    RUGGED = "RUGGED"    # Rugged/compromised tokens
+    
+    def __str__(self):
+        return self.value
