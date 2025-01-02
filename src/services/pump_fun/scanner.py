@@ -85,6 +85,7 @@ class TokenProcessor:
         self.transaction_processor = TransactionProcessor(self.rpc_client)
         self.token_program_id = Pubkey.from_string(settings['SYSTEM_TOKEN_PROGRAM'])  # Add this line
         self.rate_limiter = GlobalRateLimiter()
+        self.token_metrics = TokenMetrics(self.rpc_client)  # Add TokenMetrics instance
 
         logger.info("Token processor initialized with tier management")
 
@@ -294,11 +295,15 @@ class TokenProcessor:
                     return
                     
                 logger.info("3. checking marketcap for token...")
-                metrics = await self.token_metrics.get_all_metrics(
-                    address,
-                    curve_state
-                )
-                market_cap = metrics['market_cap_usd']
+                try:
+                    metrics = await self.token_metrics.get_all_metrics(
+                        address,
+                        curve_state
+                    )
+                    market_cap = metrics.get('market_cap_usd', 0) if metrics else 0
+                except Exception as e:
+                    logger.error(f"Error getting metrics for {address}: {e}")
+                    market_cap = 0
                 
                 logger.info("4. checking tokens left for token...")
                 tokens_left = self.calculate_tokens_left(
@@ -372,12 +377,16 @@ class TokenProcessor:
                     price_usd=market_cap / (10**9) if market_cap > 0 else 0,  # Assuming 9 decimals
                     volume_24h_usd=token_data.get('volume_24h', 0),
                     holder_count=token_data.get('holder_count', 0),
-                    risk_score=risk_score,
+                    risk_score=0.0,  # Default until analysis
                     whale_holdings=token_data.get('whale_holdings', 0.0),
                     smart_money_flow=token_data.get('smart_money_flow', 0.0)
                 )
                 
-                await db.add(meme_coin)
+                if not meme_coin:
+                    logger.error("Failed to create MemeCoin instance")
+                    return
+                
+                db.add(meme_coin)
                 await db.flush()
 
                 # Create tier metrics
@@ -454,8 +463,8 @@ class TokenProcessor:
 
 
                 # Add records to database
-                await db.add(wallet_analysis)
-                await db.add(token_tier)
+                db.add(wallet_analysis)
+                db.add(token_tier)
                 await db.commit()
                 await db.refresh(meme_coin)
                 await db.refresh(token_tier)

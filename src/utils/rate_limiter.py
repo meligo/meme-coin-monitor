@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Any, Callable, Dict, List, Optional, TypeVar, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, TypeVar, Union
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +72,11 @@ class GlobalRateLimiter:
 
     def __init__(
         self,
-        max_rps: int = 240,
-        max_concurrent: int = 10,
-        min_delay: float = 0.02,
-        max_retries: int = 3,
-        base_delay: float = 2.0,
+        max_rps: int = 250,
+        max_concurrent: int = 250,
+        min_delay: float = 0.001,
+        max_retries: int = 10,
+        base_delay: float = 0.1,
         metric_reset_interval: int = 3600
     ):
         if self._initialized:
@@ -250,21 +250,13 @@ class GlobalRateLimiter:
                     raise
 
     async def execute_batch(
-        self,
-        requests: List[Dict[str, Any]],
-        batch_size: int = 10,
-        raise_exceptions: bool = False
-    ) -> List[Any]:
+    self,
+    requests: List[Dict[str, Any]],
+    batch_size: int = 50,  # Increased from 10 to 50
+    raise_exceptions: bool = False
+) -> List[Any]:
         """
         Execute a batch of RPC requests with rate limiting and concurrent execution
-        
-        Args:
-            requests: List of request dictionaries with 'func' and optional 'args'/'kwargs'
-            batch_size: Maximum number of concurrent requests
-            raise_exceptions: Whether to raise exceptions or return them in results
-            
-        Returns:
-            List of results or exceptions if raise_exceptions is False
         """
         results = []
         batches = [requests[i:i + batch_size] for i in range(0, len(requests), batch_size)]
@@ -286,16 +278,15 @@ class GlobalRateLimiter:
             batch_results = await asyncio.gather(*batch_tasks, return_exceptions=not raise_exceptions)
             results.extend(batch_results)
             
-            # Log batch completion
+            # Very small delay between batches if not the last batch
+            if batch_idx < len(batches) - 1:
+                await asyncio.sleep(0.001)  # Reduced from higher values
+            
             success_count = sum(1 for r in batch_results if not isinstance(r, Exception))
             logger.info(
                 f"Completed batch {batch_idx + 1}/{len(batches)} "
                 f"({success_count}/{len(batch)} successful)"
             )
-            
-            # Small delay between batches if not the last batch
-            if batch_idx < len(batches) - 1:
-                await asyncio.sleep(self.min_delay)
         
         return results
 
@@ -340,14 +331,9 @@ class GlobalRateLimiter:
             if current_time - ts <= 1.0
         ]
         
-        # If at rate limit, wait until we can make another call
+        # If at rate limit, wait minimal time
         if len(self.call_timestamps) >= self.max_rps:
-            await asyncio.sleep(
-                max(
-                    self.min_delay,
-                    1.0 - (current_time - self.call_timestamps[0])
-                )
-            )
+            await asyncio.sleep(0.001)  # Minimal delay
         
         self.call_timestamps.append(current_time)
 

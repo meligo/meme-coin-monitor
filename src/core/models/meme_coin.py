@@ -12,6 +12,9 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
+    Table,
+    MetaData,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
@@ -89,10 +92,11 @@ class MemeCoin(Base):
     wallet_analyses = relationship("WalletAnalysis", back_populates="token")
     transactions = relationship("WalletTransaction", back_populates="meme_coin")
 
-    __table_args__ = {'comment': 'Main table storing meme coin information and metrics'}
+    __table_args__ = (
+        {'comment': 'Main table storing meme coin information and metrics'},
+    )
 
 
-# Keep the rest of the models unchanged...
 class TokenPrice(Base):
     __tablename__ = 'token_prices'
     
@@ -107,6 +111,7 @@ class TokenPrice(Base):
     token = relationship("MemeCoin", back_populates="price_history")
     
     __table_args__ = (
+        UniqueConstraint('token_id', 'timestamp', name='uq_token_price_token_timestamp'),
         {'comment': 'Historical price and market data for tokens'}
     )
 
@@ -117,12 +122,13 @@ class HolderSnapshot(Base):
     token_id = Column(Integer, ForeignKey('meme_coins.id'), nullable=False)
     timestamp = Column(DateTime, nullable=False, index=True)
     holder_count = Column(Integer)
-    holder_distribution = Column(JSONB)  # Snapshot of holder distribution
-    concentration_metrics = Column(JSONB)  # Gini coefficient, etc.
+    holder_distribution = Column(JSONB)
+    concentration_metrics = Column(JSONB)
     
     token = relationship("MemeCoin", back_populates="holder_snapshots")
     
     __table_args__ = (
+        UniqueConstraint('token_id', 'timestamp', name='uq_holder_snapshot_token_timestamp'),
         {'comment': 'Historical holder data and distribution metrics'}
     )
 
@@ -142,6 +148,7 @@ class TradingVolume(Base):
     token = relationship("MemeCoin", back_populates="trading_volumes")
     
     __table_args__ = (
+        UniqueConstraint('token_id', 'timestamp', name='uq_trading_volume_token_timestamp'),
         {'comment': 'Detailed trading volume and participant metrics'}
     )
 
@@ -158,8 +165,8 @@ class TokenMetadata(Base):
     tags = Column(JSONB)  # Array of descriptive tags
     custom_metadata = Column(JSONB)  # Any additional metadata
     
-    token = relationship("MemeCoin", back_populates="token_metadata")  # Changed back_populates to match new name
+    token = relationship("MemeCoin", back_populates="token_metadata")
     
     __table_args__ = (
-        {'comment': 'Additional token metadata and social information'}
+        {'comment': 'Additional token metadata and social information'},
     )

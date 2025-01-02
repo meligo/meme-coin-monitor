@@ -915,7 +915,7 @@ class TokenMonitor:
                     sig.signature,
                     encoding="jsonParsed",
                     commitment=Commitment("confirmed"),
-                    maxSupportedTransactionVersion=0
+                    max_supported_transaction_version=0
                 )
                 if not tx.value or not tx.value.meta:
                     continue

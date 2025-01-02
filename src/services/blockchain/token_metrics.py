@@ -1,16 +1,37 @@
 import asyncio
-import aiohttp
+import base64
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+import aiohttp
+from construct import Flag, Int8ul, Int64ul, Struct
 from solana.rpc.async_api import AsyncClient
-from solders.pubkey import Pubkey
+from solana.rpc.commitment import Commitment
+from solana.rpc.types import MemcmpOpts
 from solders.instruction import Instruction
+from solders.pubkey import Pubkey
+
 from src.config.settings import settings
 from src.utils.rate_limiter import GlobalRateLimiter
 
 logger = logging.getLogger(__name__)
 
+class BondingCurveState:
+    _STRUCT = Struct(
+        "virtual_token_reserves" / Int64ul,
+        "virtual_sol_reserves" / Int64ul,
+        "real_token_reserves" / Int64ul,
+        "real_sol_reserves" / Int64ul,
+        "token_total_supply" / Int64ul,
+        "complete" / Flag
+    )
+
+    def __init__(self, data: bytes) -> None:
+        parsed = self._STRUCT.parse(data[8:])
+        self.__dict__.update(parsed)
+        
 class TokenMetrics:
     def __init__(self, rpc_client: AsyncClient):
         self.rpc_client = rpc_client
@@ -36,7 +57,7 @@ class TokenMetrics:
             )[0]
             
             # Call all metrics with rate limiting
-            volume_24h = await self.get_token_volume_24h(token_address, str(bonding_curve_address))
+            volume_24h = await self.get_token_volume_24h(token_address)
             holder_count = await self.get_holder_count(token_address)
             sol_price = await self._get_sol_price()
             
@@ -44,8 +65,8 @@ class TokenMetrics:
             market_cap = self.calculate_market_cap(curve_state, sol_price)
             smart_money_flow = await self._calculate_smart_money_flow(
                 token_address,
+                market_cap,
                 volume_24h,
-                market_cap
             )
             liquidity = self._calculate_liquidity(curve_state, sol_price)
             
@@ -72,74 +93,133 @@ class TokenMetrics:
             }
 
     async def _calculate_smart_money_flow(
-        self,
+        self, 
         token_address: str,
-        volume_24h: float,
-        market_cap: float
-    ) -> float:
+        market_cap: Optional[float] = None,
+        volume_24h: Optional[float] = None
+    ) -> Dict[str, Any]:
         """
-        Calculate smart money flow metric based on transaction patterns
+        Calculate smart money flow metrics - tracks sophisticated wallet movements
         
         Args:
             token_address: Token's address
-            volume_24h: 24h trading volume
-            market_cap: Current market cap
+            market_cap: Optional current market cap for relative size calculations
+            volume_24h: Optional 24h volume for relative size calculations
             
         Returns:
-            float: Smart money flow score (0-1)
+            Dict containing:
+            - smart_money_flow_score: -1.0 to 1.0 indicating smart money direction
+            - whale_transactions: List of recent whale transactions
+            - smart_wallet_count: Number of smart wallets involved
+            - concentration_score: 0.0 to 1.0 indicating whale concentration
         """
         try:
-            if volume_24h == 0 or market_cap == 0:
-                return 0.0
+            # Config
+            SMART_MONEY_THRESHOLD = 0.01  # 1% of supply or market cap
+            WHALE_TRANSACTION_COUNT = 100
             
-            # Get recent transactions with rate limiting
-            signatures = await self.rate_limiter.call(
+            # Get recent transactions
+            response = await self.rate_limiter.call(
                 self.rpc_client.get_signatures_for_address,
                 Pubkey.from_string(token_address),
-                limit=100
+                limit=WHALE_TRANSACTION_COUNT,
+                commitment=Commitment("confirmed")
             )
             
-            if not signatures.value:
-                return 0.0
+            if not response.value:
+                return self._get_default_smart_money_metrics()
                 
-            total_volume = 0
-            smart_volume = 0
+            # Track metrics
+            inflow = 0.0
+            outflow = 0.0
+            whale_txs = []
+            smart_wallets = set()
             
-            # Process transactions in batches with rate limiting
-            batch_size = 10
-            for i in range(0, len(signatures.value), batch_size):
-                batch = signatures.value[i:i + batch_size]
-                batch_calls = [
-                    {'func': self.rpc_client.get_transaction, 'args': [sig.signature]}
-                    for sig in batch
-                ]
-                
-                batch_results = await self.rate_limiter.execute_batch(batch_calls, batch_size=5)
-                
-                for tx in batch_results:
-                    if isinstance(tx, Exception) or not tx.value:
-                        continue
-                        
-                    # Analyze transaction
-                    volume = await self._get_transaction_volume(tx.value)
-                    if volume == 0:
-                        continue
-                        
-                    total_volume += volume
+            # Process transactions in parallel with rate limiting
+            tx_requests = []
+            for sig in response.value:
+                tx_requests.append({
+                    'func': self.rpc_client.get_transaction,
+                    'args': [sig.signature],
+                    'kwargs': {
+                        'encoding': "jsonParsed",
+                        'commitment': Commitment("confirmed"),
+                        'max_supported_transaction_version': 0
+                    }
+                })
+            
+            transactions = await self.rate_limiter.execute_batch(tx_requests, batch_size=20)
+            
+            # Process each transaction
+            for tx in transactions:
+                if isinstance(tx, Exception) or not tx or not tx.value:
+                    continue
                     
-                    # Check if it's a "smart money" transaction
-                    if await self._is_smart_transaction(tx.value, market_cap):
-                        smart_volume += volume
-                    
-            # Calculate smart money ratio
-            if total_volume == 0:
-                return 0.0
+                tx_data = tx.value
                 
-            return min(1.0, smart_volume / total_volume)
+                # Calculate transaction value
+                pre_balances = {
+                    acc.account_index: acc.ui_token_amount.ui_amount 
+                    for acc in tx_data.meta.pre_token_balances
+                }
+                post_balances = {
+                    acc.account_index: acc.ui_token_amount.ui_amount
+                    for acc in tx_data.meta.post_token_balances
+                }
+                
+                # Track changed balances
+                for acc_idx, pre_bal in pre_balances.items():
+                    post_bal = post_balances.get(acc_idx, 0)
+                    change = post_bal - pre_bal
+                    
+                    # Filter for significant movements
+                    if abs(change) > SMART_MONEY_THRESHOLD * (market_cap or 1.0):
+                        if change > 0:
+                            inflow += abs(change)
+                        else:
+                            outflow += abs(change)
+                            
+                        # Track whale transaction
+                        whale_txs.append({
+                            'signature': tx_data.transaction.signatures[0],
+                            'amount': abs(change),
+                            'direction': 'in' if change > 0 else 'out',
+                            'wallet': tx_data.transaction.message.account_keys[acc_idx],
+                            'timestamp': tx_data.block_time
+                        })
+                        
+                        # Track unique smart wallets
+                        smart_wallets.add(tx_data.transaction.message.account_keys[acc_idx])
+            
+            # Calculate metrics
+            total_flow = inflow + outflow
+            flow_score = ((inflow - outflow) / total_flow) if total_flow > 0 else 0
+            
+            # Calculate concentration
+            if market_cap and market_cap > 0:
+                concentration = total_flow / market_cap
+            else:
+                concentration = total_flow / (inflow + outflow) if (inflow + outflow) > 0 else 0
+            
+            return {
+                'smart_money_flow_score': max(-1.0, min(1.0, flow_score)),
+                'whale_transactions': whale_txs[:10],  # Return most recent 10
+                'smart_wallet_count': len(smart_wallets),
+                'concentration_score': max(0.0, min(1.0, concentration))
+            }
             
         except Exception as e:
             logger.error(f"Error calculating smart money flow: {e}")
-            return 0.0
+            return self._get_default_smart_money_metrics()
+        
+    def _get_default_smart_money_metrics(self) -> Dict[str, Any]:
+        """Get default metrics structure with zero values"""
+        return {
+            'smart_money_flow_score': 0.0,
+            'whale_transactions': [],
+            'smart_wallet_count': 0,
+            'concentration_score': 0.0
+        }
             
     async def _is_smart_transaction(self, tx: Any, market_cap: float) -> bool:
         """Determine if a transaction shows sophisticated trading behavior"""
@@ -163,75 +243,141 @@ class TokenMetrics:
             logger.error(f"Error analyzing transaction: {e}")
             return False
 
-    async def get_token_volume_24h(self, token_address: str, bonding_curve_address: str) -> float:
-        """Get 24h volume for a token by analyzing bonding curve transactions"""
+    async def get_token_volume_24h(self, token_address: str) -> Dict[str, float]:
+        """Get 24h trading volume for a token with proper pagination"""
         try:
-            # Get recent signatures with rate limiting
-            signatures = await self.rate_limiter.call(
-                self.rpc_client.get_signatures_for_address,
-                Pubkey.from_string(bonding_curve_address),
-                limit=1000
-            )
+            # Get timestamp 24h ago
+            current_time = int(time.time())
+            time_24h_ago = current_time - 86400  # 24 hours in seconds
             
-            if not signatures.value:
-                return 0.0
-
-            total_volume = 0.0
-            time_cutoff = datetime.now() - timedelta(hours=24)
+            volume_data = {
+                "volume_usd": 0.0,
+                "transaction_count": 0
+            }
             
-            # Process in batches with rate limiting
-            batch_size = 10
-            for i in range(0, len(signatures.value), batch_size):
-                batch = signatures.value[i:i + batch_size]
-                batch_calls = [
-                    {'func': self.rpc_client.get_transaction, 'args': [sig.signature]}
-                    for sig in batch
-                    if sig.block_time and datetime.fromtimestamp(sig.block_time) >= time_cutoff
+            # Initialize pagination variables
+            all_signatures = []
+            last_signature = None
+            
+            # Keep fetching until we either:
+            # 1. Get all signatures within 24h
+            # 2. There are no more signatures
+            while True:
+                # Use rate limiter for RPC call with proper pagination
+                response = await self.rate_limiter.call(
+                    self.rpc_client.get_signatures_for_address,
+                    Pubkey.from_string(token_address),
+                    before=last_signature,  # Use before instead of until
+                    limit=1000,  # Max limit per request
+                    commitment=Commitment("confirmed")
+                )
+                
+                if not response.value:
+                    break
+                    
+                # Filter signatures within 24h window
+                current_batch = [
+                    sig for sig in response.value 
+                    if sig.block_time and sig.block_time >= time_24h_ago
                 ]
                 
-                if not batch_calls:
-                    continue
+                # If the oldest signature is older than 24h, we're done
+                if current_batch and current_batch[-1].block_time < time_24h_ago:
+                    break
                     
-                batch_results = await self.rate_limiter.execute_batch(batch_calls, batch_size=5)
+                all_signatures.extend(current_batch)
                 
-                for result in batch_results:
-                    if isinstance(result, Exception):
-                        continue
-                    volume = await self._process_volume_transaction(result)
-                    if isinstance(volume, float):
-                        total_volume += volume
+                # Update last signature for next iteration
+                if len(response.value) < 1000:  # Less than max means we're done
+                    break
+                    
+                last_signature = response.value[-1].signature
 
-            return total_volume
+            # Process found signatures in batches
+            if all_signatures:
+                # Prepare transaction requests
+                tx_requests = []
+                for sig in all_signatures:
+                    tx_requests.append({
+                        'func': self.rpc_client.get_transaction,
+                        'args': [sig.signature],
+                        'kwargs': {
+                            'encoding': "jsonParsed",
+                            'commitment': Commitment("confirmed"),
+                            'max_supported_transaction_version': 0
+                        }
+                    })
+                
+                # Execute batch requests with rate limiting
+                transactions = await self.rate_limiter.execute_batch(
+                    tx_requests, 
+                    batch_size=20
+                )
+                
+                # Process each transaction
+                for tx in transactions:
+                    if isinstance(tx, Exception) or not tx or not tx.value:
+                        continue
+                    
+                    volume = await self._process_volume_transaction(tx.value)
+                    if volume > 0:
+                        volume_data["volume_usd"] += volume
+                        volume_data["transaction_count"] += 1
+
+            return volume_data
 
         except Exception as e:
-            logger.error(f"Error getting volume for {token_address}: {e}")
-            return 0.0
+            logger.error(f"Error getting 24h volume: {e}")
+            return {
+                "volume_usd": 0.0,
+                "transaction_count": 0
+            }
 
     async def get_holder_count(self, token_address: str) -> int:
-        """Get current number of token holders"""
+        """Get current number of token holders by counting non-zero balance accounts"""
         try:
-            # Get token accounts with rate limiting
-            accounts = await self.rate_limiter.call(
-                self.rpc_client.get_token_accounts_by_mint,
-                mint=Pubkey.from_string(token_address),
-                commitment="confirmed"
+            # Convert token address to proper format
+            mint_pubkey = Pubkey.from_string(token_address)
+            token_program_id = Pubkey.from_string('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')
+            
+            # Create proper filter objects
+            filters = [
+                {"dataSize": 165},  # Token account size
+                {
+                    "memcmp": MemcmpOpts(
+                        offset=0,
+                        bytes=str(mint_pubkey)
+                    )
+                }
+            ]
+            
+            # Use data slice to only get balance bytes
+            data_slice = {
+                "offset": 64,
+                "length": 8
+            }
+            
+            # Get accounts with rate limiting
+            response = await self.rate_limiter.call(
+                self.rpc_client.get_program_accounts,
+                token_program_id,
+                commitment=Commitment("confirmed"),
+                encoding="base64",
+                filters=filters,
+                data_slice=data_slice
             )
             
-            if not accounts.value:
+            if not response.value:
                 return 0
-
-            # Count non-zero balance holders
-            unique_holders = set()
-            for account in accounts.value:
-                try:
-                    parsed_data = account.account.data['parsed']['info']
-                    balance = int(parsed_data['tokenAmount']['amount'])
-                    if balance > 0:
-                        unique_holders.add(parsed_data['owner'])
-                except (KeyError, ValueError):
-                    continue
-
-            return len(unique_holders)
+                
+            # Count non-zero balances
+            holder_count = 0
+            for acc in response.value:
+                balance = int.from_bytes(base64.b64decode(acc.account.data[0]), 'little')
+                if balance > 0:
+                    holder_count += 1
+                    
+            return holder_count
 
         except Exception as e:
             logger.error(f"Error getting holder count: {e}")
@@ -295,13 +441,13 @@ class TokenMetrics:
             return 0.0
 
     async def _get_sol_price(self) -> float:
-        """Get current SOL price in USD"""
+        """Get current SOL price in USD using Raydium API"""
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get('https://price.jup.ag/v4/price?ids=SOL') as response:
+                async with session.get('https://api.raydium.io/v2/main/price') as response:
                     if response.status == 200:
                         data = await response.json()
-                        return float(data['data']['SOL']['price'])
+                        return float(data.get('SOL', {}).get('price', 0))
             return 0.0
         except Exception as e:
             logger.error(f"Error getting SOL price: {e}")
@@ -310,14 +456,44 @@ class TokenMetrics:
     async def _process_volume_transaction(self, tx: Any) -> float:
         """Process a single transaction for volume calculation"""
         try:
-            if not tx.value or not tx.value.meta:
+            # Check if we have a proper transaction object with metadata
+            if not hasattr(tx, 'meta'):
+                return 0.0
+                
+            # We only need meta_data for balance changes
+            meta_data = tx.meta
+            
+            if not meta_data:
                 return 0.0
 
+            # Calculate total volume from pre/post balances
             total_volume = 0.0
-            for pre, post in zip(tx.value.meta.pre_balances, tx.value.meta.post_balances):
-                if pre != post:
-                    volume = abs(post - pre) / 1e9  # Convert lamports to SOL
-                    total_volume += volume
+            
+            # Get pre and post token balances
+            pre_balances = getattr(meta_data, 'pre_token_balances', []) or []
+            post_balances = getattr(meta_data, 'post_token_balances', []) or []
+            
+            # Create balance lookup maps
+            pre_map = {
+                bal.account_index: float(bal.ui_token_amount.amount)
+                for bal in pre_balances
+                if hasattr(bal, 'ui_token_amount')
+            }
+            
+            post_map = {
+                bal.account_index: float(bal.ui_token_amount.amount)
+                for bal in post_balances
+                if hasattr(bal, 'ui_token_amount')
+            }
+            
+            # Calculate volume from balance changes
+            for acc_idx in set(pre_map.keys()) | set(post_map.keys()):
+                pre_amount = pre_map.get(acc_idx, 0.0)
+                post_amount = post_map.get(acc_idx, 0.0)
+                
+                change = abs(post_amount - pre_amount)
+                if change > 0:
+                    total_volume += change
 
             return total_volume
 

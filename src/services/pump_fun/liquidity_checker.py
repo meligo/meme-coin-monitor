@@ -5,6 +5,7 @@ import struct
 from typing import Dict, List, Optional, Union
 
 from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Commitment
 from solders.pubkey import Pubkey
 
 logger = logging.getLogger(__name__)
@@ -113,7 +114,13 @@ class LiquidityChecker:
     async def _process_transaction(self, signature: str) -> float:
         """Process a single transaction to find liquidity value"""
         try:
-            tx = await self.rpc_client.get_transaction(signature)
+            tx = await self.rate_limiter.call(
+                self.rpc_client.get_transaction,
+                signature,
+                encoding="jsonParsed",
+                commitment=Commitment("confirmed"),
+                max_supported_transaction_version=0  # Changed to camelCase
+            )
             if not tx.value or not tx.value.meta or not tx.value.meta.log_messages:
                 return 0.0
 

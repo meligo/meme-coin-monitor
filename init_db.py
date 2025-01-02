@@ -1,8 +1,17 @@
 import os
 import sys
+import logging
+from traceback import format_exc
 
 from sqlalchemy import MetaData, create_engine, inspect, text
 from sqlalchemy_utils import create_database, database_exists, drop_database
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Add the project root directory to the Python path
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -22,88 +31,102 @@ from src.core.models.tier_models import TierAlert, TierTransition, TokenTier
 from src.core.models.wallet_analysis import WalletAnalysis, WalletTransaction
 
 
+def verify_model_relationships():
+    """Verify and log all model relationships"""
+    logger.info("\nVerifying model relationships...")
+    
+    relationships = {
+        'MemeCoin': {
+            'tier': 'TokenTier',
+            'price_history': 'TokenPrice',
+            'holder_snapshots': 'HolderSnapshot',
+            'trading_volumes': 'TradingVolume',
+            'token_metadata': 'TokenMetadata',
+            'wallet_analyses': 'WalletAnalysis',
+            'transactions': 'WalletTransaction'
+        },
+        'TokenTier': {
+            'token': 'MemeCoin',
+            'tier_transitions': 'TierTransition',
+            'tier_alerts': 'TierAlert'
+        }
+    }
+    
+    for model, relations in relationships.items():
+        logger.info(f"{model} relationships:")
+        for rel_name, rel_type in relations.items():
+            logger.info(f"  - {rel_name} ({rel_type})")
+
+
 def init_database():
-    print(f"Database URL: {settings['DATABASE_URL']}")
-    print("\nInitializing database...")
+    """Initialize the database with all tables and constraints"""
+    logger.info(f"Database URL: {settings['DATABASE_URL']}")
+    logger.info("\nInitializing database...")
     
     engine = create_engine(settings['DATABASE_URL'])
     
     # Create database if it doesn't exist
     if not database_exists(engine.url):
-        print(f"Creating database: {engine.url.database}")
+        logger.info(f"Creating database: {engine.url.database}")
         create_database(engine.url)
-        print("Database created successfully!")
+        logger.info("Database created successfully!")
     else:
-        print(f"Database {engine.url.database} already exists")
+        logger.info(f"Database {engine.url.database} already exists")
         recreate = input("Do you want to recreate the database? (y/n): ")
         if recreate.lower() == 'y':
-            print("Dropping existing database...")
+            logger.info("Dropping existing database...")
             drop_database(engine.url)
-            print("Creating new database...")
+            logger.info("Creating new database...")
             create_database(engine.url)
 
     # Create all tables
-    print("\nCreating tables...")
+    logger.info("\nCreating tables...")
     Base.metadata.drop_all(bind=engine)  # Drop existing tables
     Base.metadata.create_all(bind=engine)  # Create all tables fresh
-    print("Tables created successfully!")
+    logger.info("Tables created successfully!")
 
     # Verify tables and their structures
     inspector = inspect(engine)
     tables = inspector.get_table_names()
     
-    print("\nCreated tables:")
+    logger.info("\nCreated tables:")
     for table in tables:
-        print(f"\n{table}:")
+        logger.info(f"\n{table}:")
         columns = inspector.get_columns(table)
-        print("Columns:")
+        logger.info("Columns:")
         for column in columns:
             col_type = str(column['type'])
             nullable = "NULL" if column['nullable'] else "NOT NULL"
             primary_key = "PRIMARY KEY" if column.get('primary_key', False) else ""
-            print(f"  - {column['name']}: {col_type} {nullable} {primary_key}")
+            logger.info(f"  - {column['name']}: {col_type} {nullable} {primary_key}")
 
         # Show foreign keys if any
         foreign_keys = inspector.get_foreign_keys(table)
         if foreign_keys:
-            print("Foreign Keys:")
+            logger.info("Foreign Keys:")
             for fk in foreign_keys:
-                print(f"  - {fk['constrained_columns']} -> {fk['referred_table']}.{fk['referred_columns']}")
+                logger.info(f"  - {fk['constrained_columns']} -> {fk['referred_table']}.{fk['referred_columns']}")
 
         # Show indices if any
         indices = inspector.get_indexes(table)
         if indices:
-            print("Indices:")
+            logger.info("Indices:")
             for idx in indices:
                 unique = "UNIQUE " if idx['unique'] else ""
-                print(f"  - {unique}INDEX on ({', '.join(idx['column_names'])})")
+                logger.info(f"  - {unique}INDEX on ({', '.join(idx['column_names'])})")
 
     return engine
+
 
 if __name__ == "__main__":
     try:
         engine = init_database()
-        print("\nDatabase initialization completed successfully!")
-        
-        # Verify model relationships
-        print("\nVerifying model relationships...")
-        print("MemeCoin relationships:")
-        print("  - tier (TokenTier)")
-        print("  - price_history (TokenPrice)")
-        print("  - holder_snapshots (HolderSnapshot)")
-        print("  - trading_volumes (TradingVolume)")
-        print("  - token_metadata (TokenMetadata)")
-        print("  - wallet_analyses (WalletAnalysis)")
-        print("  - transactions (WalletTransaction)")
-        
-        print("\nTokenTier relationships:")
-        print("  - token (MemeCoin)")
-        print("  - tier_transitions (TierTransition)")
-        print("  - tier_alerts (TierAlert)")
-        
-        print("\nAll model relationships verified successfully!")
+        logger.info("\nDatabase initialization completed successfully!")
+        verify_model_relationships()
+        logger.info("\nAll model relationships verified successfully!")
         
     except Exception as e:
-        print(f"\nError initializing database: {str(e)}")
-        print("\nFull error traceback:", exc_info=True)
+        logger.error(f"\nError initializing database: {str(e)}")
+        logger.error("\nFull error traceback:")
+        logger.error(format_exc())
         raise

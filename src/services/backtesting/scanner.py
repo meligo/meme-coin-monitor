@@ -110,15 +110,10 @@ class BacktestScanner(PumpFunScanner):
             }
             for sig in signatures
         ]
-        
-        # Execute batch with rate limiting
-        responses = await self.rate_limiter.execute_batch(
-            batch_requests,
-            batch_size=20  # Process in smaller sub-batches
-        )
+        responses = await self.rate_limiter.execute_batch(batch_requests, batch_size=20)
         
         # Process responses
-        for tx_response in responses:
+        for tx_response in responses:  # Changed from async for to regular for
             try:
                 if isinstance(tx_response, Exception):
                     logger.error(f"Error getting transaction: {tx_response}")
@@ -191,65 +186,63 @@ class BacktestScanner(PumpFunScanner):
         """Process a single token address with historical data"""
         try:
             # Get token from database first
-            db = next(get_db())
-            try:
-                token = db.query(MemeCoin).filter(
-                    MemeCoin.address == token_address
-                ).first()
-                
-                if not token:
-                    logger.warning(f"Token {token_address} not found in database")
-                    return False
-
-                # Convert address to Pubkey safely
+            async with get_db() as db:  # Changed to async context manager
                 try:
-                    pubkey = Pubkey.from_string(token_address)
+                    token = await db.query(MemeCoin).filter(
+                        MemeCoin.address == token_address
+                    ).first()
+                    
+                    if not token:
+                        logger.warning(f"Token {token_address} not found in database")
+                        return False
+
+                    # Convert address to Pubkey safely
+                    try:
+                        pubkey = Pubkey.from_string(token_address)
+                    except Exception as e:
+                        logger.error(f"Invalid token address format: {token_address} - {e}")
+                        return False
+
+                    # Get account info
+                    account_info = await self.retry_with_backoff(
+                        self.rpc_client.get_account_info,
+                        pubkey,
+                        commitment=Commitment("confirmed")
+                    )
+
+                    if not account_info or not account_info.value:
+                        logger.error(f"No account info found for {token_address}")
+                        return False
+
+                    # Decode and analyze token account
+                    try:
+                        data = base64.b64decode(account_info.value.data[0])
+                    except Exception as e:
+                        logger.error(f"Error decoding account data: {e}")
+                        return False
+
+                    if len(data) < 8 or data[:8] != self.TOKEN_DISCRIMINATOR:
+                        logger.error(f"Invalid token discriminator for {token_address}")
+                        return False
+
+                    # Create token data structure
+                    token_data = {
+                        'address': token_address,
+                        'name': token.name,
+                        'symbol': token.symbol,
+                        'creation_date': token.launch_date
+                    }
+
+                    # Process using token processor
+                    await self.token_processor.add_token(token_data)
+                    self.processed_tokens += 1
+                    
+                    logger.info(f"Successfully processed historical data for token: {token_address}")
+                    return True
+
                 except Exception as e:
-                    logger.error(f"Invalid token address format: {token_address} - {e}")
+                    logger.error(f"Error processing token {token_address}: {e}")
                     return False
-
-                # Get account info
-                account_info = await self.retry_with_backoff(
-                    self.rpc_client.get_account_info,
-                    pubkey,
-                    commitment=Commitment("confirmed")
-                )
-
-                if not account_info or not account_info.value:
-                    logger.error(f"No account info found for {token_address}")
-                    return False
-
-                # Decode and analyze token account
-                try:
-                    data = base64.b64decode(account_info.value.data[0])
-                except Exception as e:
-                    logger.error(f"Error decoding account data: {e}")
-                    return False
-
-                if len(data) < 8 or data[:8] != self.TOKEN_DISCRIMINATOR:
-                    logger.error(f"Invalid token discriminator for {token_address}")
-                    return False
-
-                # Create token data structure
-                token_data = {
-                    'address': token_address,
-                    'name': token.name,
-                    'symbol': token.symbol,
-                    'creation_date': token.launch_date
-                }
-
-                # Process using token processor
-                await self.token_processor.add_token(token_data)
-                self.processed_tokens += 1
-                
-                logger.info(f"Successfully processed historical data for token: {token_address}")
-                return True
-
-            except Exception as e:
-                logger.error(f"Error processing token {token_address}: {e}")
-                return False
-            finally:
-                db.close()
 
         except Exception as e:
             logger.error(f"Error in process_token: {e}")

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
+from solana.rpc.commitment import Commitment
 from solders.pubkey import Pubkey
 
 logger = logging.getLogger(__name__)
@@ -277,11 +278,13 @@ class RugDetector:
                         if tx_time < current_time - timedelta(hours=24):
                             continue
 
-                    # Get transaction with proper version handling
-                    tx = await self.rpc_client.get_transaction(
+
+                    tx = await self.rate_limiter.call(
+                        self.rpc_client.get_transaction,
                         sig.signature,
-                        commitment="confirmed",
-                        max_supported_transaction_version=0  # Required for newer transactions
+                        encoding="jsonParsed",
+                        commitment=Commitment("confirmed"),
+                        max_supported_transaction_version=0
                     )
                     
                     if not tx or not hasattr(tx, 'value') or not tx.value:
