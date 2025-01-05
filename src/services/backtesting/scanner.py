@@ -491,7 +491,7 @@ class BacktestScanner(PumpFunScanner):
                         sig_time = datetime.fromtimestamp(sig.block_time, tz=timezone.utc)
                         if sig_time < start_time:
                             return signatures
-                    logger.info(f"signature append {sig.signature}")
+                    #logger.info(f"signature append {sig.signature}")
                     signatures.append(sig.signature)
 
                 if not signatures:
@@ -539,49 +539,43 @@ class BacktestScanner(PumpFunScanner):
     async def identify_instruction_type(self, logs: List[str]) -> str:
         """Identify the type of pump.fun instruction from transaction logs"""
         try:
+            logger.info(f"logs: {logs}")
             for log in logs:
-                if "Instruction: Create" in log:
+                if "Program log: Instruction: Create" in log:
                     return "CREATE"
-                elif "Instruction: Buy" in log:
-                    return "BUY"
-                elif "Instruction: Sell" in log:
-                    return "SELL"
-                elif "Instruction: AddLiquidity" in log:
-                    return "ADD_LIQUIDITY"
-                elif "Instruction: RemoveLiquidity" in log:
-                    return "REMOVE_LIQUIDITY"
             return "UNKNOWN"
-            
+                
         except Exception as e:
             logger.error(f"Error identifying instruction type: {e}")
             return "ERROR"
 
     async def process_signature_batch(self, signatures: List[str]) -> List[Dict]:
         """Process a batch of transaction signatures"""
-        results = []
+        new_tokens = []
         for signature in signatures:
             try:
                 tx_details = await self.get_transaction_details(signature)
-                if not tx_details:
+                if not tx_details or not tx_details.get('logs'):
                     continue
                     
-                # Identify instruction type
+                # Only process Create instructions
                 instruction_type = await self.identify_instruction_type(tx_details['logs'])
-                
-                # For CREATE instructions, extract token data
-                if instruction_type == "CREATE":
-                    # Extract newly created token from post balances
-                    new_tokens = [
-                        balance.mint 
-                        for balance in tx_details['post_token_balances']
-                        if not any(
-                            pre_bal.mint == balance.mint 
-                            for pre_bal in tx_details['pre_token_balances']
-                        )
-                    ]
+                if instruction_type != "CREATE":
+                    continue
                     
-                    if new_tokens:
-                        results.extend(new_tokens)
+                # Extract newly created token from post balances
+                token_balances = [
+                    balance.mint 
+                    for balance in tx_details['post_token_balances']
+                    if not any(
+                        pre_bal.mint == balance.mint 
+                        for pre_bal in tx_details['pre_token_balances']
+                    )
+                ]
+                
+                if token_balances:
+                    logger.info(f"Found new token creation in tx {signature} with create")
+                    new_tokens.extend(token_balances)
                 
                 # Rate limiting
                 await asyncio.sleep(0.1)
@@ -590,7 +584,7 @@ class BacktestScanner(PumpFunScanner):
                 logger.error(f"Error processing signature {signature}: {e}")
                 continue
                 
-        return results
+        return new_tokens
 
     async def validate_token_data(self, token_data: Dict) -> bool:
         """Validate token data structure and required fields"""
