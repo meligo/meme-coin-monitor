@@ -1,35 +1,28 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
-    JSON,
     BigInteger,
     Boolean,
     Column,
     DateTime,
-    Enum,
     Float,
     ForeignKey,
     Integer,
     String,
     Text,
     UniqueConstraint,
-    Table,
-    MetaData,
+    func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
 
-from src.core.models.base import Base
-from src.core.models.tier_models import TokenTier
+from src.core.models.base import BaseModel
 
 
-class MemeCoin(Base):
-    __tablename__ = 'meme_coins'
-
+class MemeCoin(BaseModel):
+    """Main table storing meme coin information and metrics"""
+    
     # Core Information
-    id = Column(Integer, primary_key=True)
-    # Changed address length to 64 to accommodate longer addresses
     address = Column(String(255), unique=True, nullable=False, index=True)
     name = Column(String(255))
     symbol = Column(String(255))
@@ -37,18 +30,19 @@ class MemeCoin(Base):
     total_supply = Column(BigInteger)
     
     # Contract Details
-    creator_address = Column(String(255))  # Increased from 42
+    creator_address = Column(String(255))
     creation_tx_hash = Column(Text)
     contract_verified = Column(Boolean, default=False)
-    contract_code = Column(Text, nullable=True)
+    contract_code = Column(Text)
     contract_analysis = Column(JSONB)
-    
+    is_active = Column(Boolean, default=True, nullable=False)
+    monitoring_status = Column(String(50), default='active')
     # Supply Information
     circulating_supply = Column(BigInteger)
     burned_supply = Column(BigInteger)
     
     # Bonding Curve Information
-    bonding_curve_address = Column(String(255))  # Increased from 42
+    bonding_curve_address = Column(String(255))
     bonding_curve_state = Column(JSONB)
     is_curve_complete = Column(Boolean)
     tokens_left = Column(BigInteger)
@@ -62,12 +56,12 @@ class MemeCoin(Base):
     market_cap_usd = Column(Float)
     volume_24h_usd = Column(Float)
     liquidity = Column(Float)
-    liquidity_pairs = Column(JSONB)  # Stores all trading pair information
+    liquidity_pairs = Column(JSONB)
     
     # Holder Information
     holder_count = Column(Integer)
-    holder_distribution = Column(JSONB)  # Distribution statistics
-    top_holders = Column(JSONB)  # Top holder addresses and balances
+    holder_distribution = Column(JSONB)
+    top_holders = Column(JSONB)
     
     # Risk Metrics
     risk_score = Column(Float)
@@ -78,95 +72,129 @@ class MemeCoin(Base):
     smart_money_flow = Column(Float)
     holder_growth_rate = Column(Float)
     
-    # Timestamps
-    launch_date = Column(DateTime)
-    created_at = Column(DateTime, default=func.now())
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
-    
-    # Relationships
-    tier = relationship("TokenTier", back_populates="token", uselist=False)
-    price_history = relationship("TokenPrice", back_populates="token")
-    holder_snapshots = relationship("HolderSnapshot", back_populates="token")
-    trading_volumes = relationship("TradingVolume", back_populates="token")
-    token_metadata = relationship("TokenMetadata", back_populates="token", uselist=False)
-    wallet_analyses = relationship("WalletAnalysis", back_populates="token")
-    transactions = relationship("WalletTransaction", back_populates="meme_coin")
+    # Launch Information
+    launch_date = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
-    __table_args__ = (
-        {'comment': 'Main table storing meme coin information and metrics'},
+    # Relationships
+    tier = relationship(
+        "TokenTier",
+        back_populates="token",
+        uselist=False
+    )
+    price_history = relationship(
+        "TokenPrice",
+        back_populates="token",
+        order_by="desc(TokenPrice.timestamp)"
+    )
+    holder_snapshots = relationship(
+        "HolderSnapshot",
+        back_populates="token",
+        order_by="desc(HolderSnapshot.timestamp)"
+    )
+    trading_volumes = relationship(
+        "TradingVolume",
+        back_populates="token",
+        order_by="desc(TradingVolume.timestamp)"
+    )
+    token_metadata = relationship(
+        "TokenMetadata",
+        back_populates="token",
+        uselist=False
+    )
+    wallet_analyses = relationship(
+        "WalletAnalysis",
+        back_populates="token",
+        order_by="desc(WalletAnalysis.analysis_timestamp)"
+    )
+    transactions = relationship(
+        "WalletTransaction",
+        back_populates="meme_coin",
+        order_by="desc(WalletTransaction.timestamp)"
     )
 
+    def __repr__(self):
+        return f"<MemeCoin(address={self.address}, symbol={self.symbol})>"
 
-class TokenPrice(Base):
-    __tablename__ = 'token_prices'
+
+class TokenPrice(BaseModel):
+    """Historical price and market data for tokens"""
     
-    id = Column(Integer, primary_key=True)
-    token_id = Column(Integer, ForeignKey('meme_coins.id'), nullable=False)
-    timestamp = Column(DateTime, nullable=False, index=True)
+    token_id = Column(Integer, ForeignKey('meme_coin.id'), nullable=False)
+    timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
     price_usd = Column(Float, nullable=False)
     volume_usd = Column(Float)
     market_cap_usd = Column(Float)
     liquidity_usd = Column(Float)
     
+    # Relationship
     token = relationship("MemeCoin", back_populates="price_history")
     
     __table_args__ = (
         UniqueConstraint('token_id', 'timestamp', name='uq_token_price_token_timestamp'),
-        {'comment': 'Historical price and market data for tokens'}
     )
 
-class HolderSnapshot(Base):
-    __tablename__ = 'holder_snapshots'
+    def __repr__(self):
+        return f"<TokenPrice(token_id={self.token_id}, price=${self.price_usd:.4f})>"
+
+
+class HolderSnapshot(BaseModel):
+    """Historical holder data and distribution metrics"""
     
-    id = Column(Integer, primary_key=True)
-    token_id = Column(Integer, ForeignKey('meme_coins.id'), nullable=False)
-    timestamp = Column(DateTime, nullable=False, index=True)
+    token_id = Column(Integer, ForeignKey('meme_coin.id'), nullable=False)
+    timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
     holder_count = Column(Integer)
     holder_distribution = Column(JSONB)
     concentration_metrics = Column(JSONB)
     
+    # Relationship
     token = relationship("MemeCoin", back_populates="holder_snapshots")
     
     __table_args__ = (
         UniqueConstraint('token_id', 'timestamp', name='uq_holder_snapshot_token_timestamp'),
-        {'comment': 'Historical holder data and distribution metrics'}
     )
 
-class TradingVolume(Base):
-    __tablename__ = 'trading_volumes'
+    def __repr__(self):
+        return f"<HolderSnapshot(token_id={self.token_id}, holders={self.holder_count})>"
+
+
+class TradingVolume(BaseModel):
+    """Detailed trading volume and participant metrics"""
     
-    id = Column(Integer, primary_key=True)
-    token_id = Column(Integer, ForeignKey('meme_coins.id'), nullable=False)
-    timestamp = Column(DateTime, nullable=False, index=True)
+    token_id = Column(Integer, ForeignKey('meme_coin.id'), nullable=False)
+    timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
     volume_usd = Column(Float)
     trade_count = Column(Integer)
     buyer_count = Column(Integer)
     seller_count = Column(Integer)
-    whale_volume = Column(Float)  # Volume from whale addresses
-    smart_money_volume = Column(Float)  # Volume from known smart money addresses
+    whale_volume = Column(Float)
+    smart_money_volume = Column(Float)
     
+    # Relationship
     token = relationship("MemeCoin", back_populates="trading_volumes")
     
     __table_args__ = (
         UniqueConstraint('token_id', 'timestamp', name='uq_trading_volume_token_timestamp'),
-        {'comment': 'Detailed trading volume and participant metrics'}
     )
 
-class TokenMetadata(Base):
-    __tablename__ = 'token_metadata'
+    def __repr__(self):
+        return f"<TradingVolume(token_id={self.token_id}, volume=${self.volume_usd:.2f})>"
+
+
+class TokenMetadata(BaseModel):
+    """Additional token metadata and social information"""
     
-    id = Column(Integer, primary_key=True)
-    token_id = Column(Integer, ForeignKey('meme_coins.id'), unique=True, nullable=False)
+    token_id = Column(Integer, ForeignKey('meme_coin.id'), unique=True, nullable=False)
     website = Column(String(255))
     telegram = Column(String(255))
     twitter = Column(String(255))
     discord = Column(String(255))
     description = Column(Text)
-    tags = Column(JSONB)  # Array of descriptive tags
-    custom_metadata = Column(JSONB)  # Any additional metadata
+    tags = Column(JSONB)
+    custom_metadata = Column(JSONB)
     
+    # Relationship
     token = relationship("MemeCoin", back_populates="token_metadata")
-    
-    __table_args__ = (
-        {'comment': 'Additional token metadata and social information'},
-    )
+
+    def __repr__(self):
+        return f"<TokenMetadata(token_id={self.token_id})>"

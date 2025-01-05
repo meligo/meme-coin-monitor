@@ -4,17 +4,18 @@ import logging
 import struct
 from typing import Dict, List, Optional, Union
 
-from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Commitment
 from solders.pubkey import Pubkey
+
+from src.utils.rpc_manager import RPCManager
 
 logger = logging.getLogger(__name__)
 
 class LiquidityChecker:
     """Tracks token liquidity changes"""
 
-    def __init__(self, rpc_client: AsyncClient):
-        self.rpc_client = rpc_client
+    def __init__(self, rpc_manager: RPCManager):
+        self.rpc_manager = rpc_manager
         
     async def check_liquidity(self, token_address: str, bonding_curve_address: str) -> Dict[str, float]:
         """
@@ -33,7 +34,10 @@ class LiquidityChecker:
         try:
             # Get current bonding curve state
             curve_pubkey = Pubkey.from_string(bonding_curve_address)
-            response = await self.rpc_client.get_account_info(curve_pubkey)
+            response = await self.rpc_manager.get_account_info(
+                str(curve_pubkey)
+            )
+            
             
             if not response.value or not response.value.data:
                 logger.warning(f"No data found for bonding curve: {bonding_curve_address}")
@@ -71,7 +75,10 @@ class LiquidityChecker:
                 return self._create_liquidity_result(0.0, 0.0)
 
             # Get historical transactions to find peak liquidity
-            signatures = await self.rpc_client.get_signatures_for_address(curve_pubkey)
+            signatures = await self.rpc_manager.get_signatures_for_address(
+                str(curve_pubkey)
+            )
+            
             if not signatures.value:
                 return self._create_liquidity_result(current_liquidity, current_liquidity)
 
@@ -114,13 +121,13 @@ class LiquidityChecker:
     async def _process_transaction(self, signature: str) -> float:
         """Process a single transaction to find liquidity value"""
         try:
-            tx = await self.rate_limiter.call(
-                self.rpc_client.get_transaction,
+            tx = await self.rpc_manager.get_transaction(
                 signature,
                 encoding="jsonParsed",
-                commitment=Commitment("confirmed"),
-                max_supported_transaction_version=0  # Changed to camelCase
+                commitment="confirmed",
+                max_supported_transaction_version=0
             )
+            
             if not tx.value or not tx.value.meta or not tx.value.meta.log_messages:
                 return 0.0
 

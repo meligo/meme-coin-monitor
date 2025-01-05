@@ -1,19 +1,26 @@
 import asyncio
 import json
+import logging
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from solders.pubkey import Pubkey
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 from web3 import Web3
 from web3.contract import Contract
+
+from src.config.database import Base, engine, get_db_session
+from src.core.models.meme_coin import MemeCoin
+from src.enums.monitoring_tier import MonitoringTier
 
 from ...config.database import get_db
 from ...config.redis_config import redis_manager
 from ...config.settings import MonitoringTier, settings
 from ...core.models.meme_coin import MemeCoin
+
+logger = logging.getLogger(__name__)
 
 
 class BlockchainScanner:
@@ -135,54 +142,84 @@ class BlockchainScanner:
                 'total_supply': 0
             }
             
-    def get_tier_tokens(self, tier: MonitoringTier) -> List[MemeCoin]:
-        """Get all tokens in specified monitoring tier"""
-        db = next(get_db())
+    async def get_tier_tokens(self, tier: MonitoringTier) -> List[MemeCoin]:
+        """
+        Get all tokens in specified monitoring tier
+        
+        Args:
+            tier (MonitoringTier): The monitoring tier to query for
+            
+        Returns:
+            List[MemeCoin]: List of tokens in the specified tier
+            
+        Raises:
+            Exception: If database query fails
+        """
         try:
-            # Query tokens in the specified tier
-            tokens = db.query(MemeCoin).filter(
-                and_(
-                    MemeCoin.tier == tier,
-                    or_(
-                        MemeCoin.risk_score < 80,  # Exclude extremely high-risk tokens
-                        MemeCoin.risk_score.is_(None)
+            async with get_db_session() as db:
+                try:
+                    # Query tokens in the specified tier
+                    result = await db.execute(
+                        select(MemeCoin).where(
+                            and_(
+                                MemeCoin.tier == tier,
+                                or_(
+                                    MemeCoin.risk_score < 80,  # Exclude extremely high-risk tokens
+                                    MemeCoin.risk_score.is_(None)
+                                ),
+                                MemeCoin.is_active == True  # Only get active tokens
+                            )
+                        ).order_by(
+                            MemeCoin.market_cap_usd.desc()  # Order by market cap
+                        )
                     )
-                )
-            ).all()
-            return tokens
-        finally:
-            db.close()
+                    
+                    tokens = result.scalars().all()
+                    logger.info(
+                        f"Found {len(tokens)} active tokens in {tier.name} tier"
+                    )
+                    return tokens
+                    
+                except Exception as db_error:
+                    logger.error(
+                        f"Database error querying {tier.name} tier tokens: {str(db_error)}"
+                    )
+                    await db.rollback()
+                    raise
+                    
+        except Exception as e:
+            logger.error(f"Error in get_tier_tokens for tier {tier.name}: {str(e)}")
+            return []  # Return empty list on error rather than raising
             
     async def transition_tier(self, token: MemeCoin, new_tier: MonitoringTier):
         """Handle token transition between monitoring tiers"""
-        db = next(get_db())
-        try:
-            # Update token tier
-            token.tier = new_tier
-            token.updated_at = datetime.utcnow()
-            
-            # Clear old cache
-            old_key = self.redis.get_tier_key(token.address, token.tier.value)
-            self.redis.client.delete(old_key)
-            
-            # Update database
-            db.add(token)
-            db.commit()
-            
-            # Initialize new tier monitoring
-            metrics = await self.get_token_metrics(token.address)
-            self.redis.cache_coin_data(
-                token.address,
-                new_tier.value,
-                metrics,
-                settings.CACHE_TTLS[new_tier]
-            )
-            
-        except Exception as e:
-            db.rollback()
-            raise e
-        finally:
-            db.close()
+        async with get_db_session() as db:
+
+            try:
+                # Update token tier
+                token.tier = new_tier
+                token.updated_at = datetime.utcnow()
+                
+                # Clear old cache
+                old_key = self.redis.get_tier_key(token.address, token.tier.value)
+                self.redis.client.delete(old_key)
+                
+                # Update database
+                db.add(token)
+                await db.commit()
+                
+                # Initialize new tier monitoring
+                metrics = await self.get_token_metrics(token.address)
+                self.redis.cache_coin_data(
+                    token.address,
+                    new_tier.value,
+                    metrics,
+                    settings.CACHE_TTLS[new_tier]
+                )
+                
+            except Exception as e:
+                db.rollback()
+                raise e
             
     async def _is_valid_token(self, address: str) -> bool:
         """Check if address is a valid token contract"""

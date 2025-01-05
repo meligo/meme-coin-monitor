@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
+from src.config.database import get_db_session
 from src.core.models.tier_level import TierLevel
 from src.services.tier_management.utils.metrics import calculate_token_metrics
 

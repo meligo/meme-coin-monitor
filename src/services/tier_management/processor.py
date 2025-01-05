@@ -4,10 +4,12 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.config.database import get_db
+from src.config.database import get_db_session
+from src.core.models.base import Base
 from src.core.models.meme_coin import MemeCoin
 from src.core.models.tier_models import TierTransition, TokenTier
 
@@ -40,10 +42,46 @@ class TierProcessor:
         if self._running:
             logger.warning("Tier processor is already running")
             return
+        await self.start_services()
 
         self._running = True
         self._current_task = asyncio.create_task(self._process_queue())
         logger.info("✅ Tier processor started")
+        
+    async def start_services(self):
+        """Start all dependent services"""
+        try:
+            # Start RPC manager
+            if hasattr(self.rpc_manager, 'start'):
+                await self.rpc_manager.start()
+                
+            # Start tier services
+            if hasattr(self.tier_processor, 'start'):
+                await self.tier_processor.start()
+            if hasattr(self.tier_monitor, 'start'):
+                await self.tier_monitor.start()
+                
+            # Start analysis services
+            if hasattr(self.wallet_analyzer, 'start'):
+                await self.wallet_analyzer.start()
+            if hasattr(self.rug_detector, 'start'):
+                await self.rug_detector.start()
+                
+            # Start metrics services
+            if hasattr(self.holder_metrics_updater, 'start'):
+                await self.holder_metrics_updater.start()
+            if hasattr(self.token_metrics, 'start'):
+                await self.token_metrics.start()
+                
+            # Start main processor
+            if not self._running:
+                self._running = True
+                self._processing_task = asyncio.create_task(self._process_queue())
+                logger.info("Token processor and services started")
+                
+        except Exception as e:
+            logger.error(f"Error starting services: {e}")
+            raise
 
     async def stop(self) -> None:
         """Stop the tier processor"""
@@ -67,24 +105,22 @@ class TierProcessor:
     async def process_new_token(self, address: str, token_data: Dict[str, Any]) -> None:
         """Process a newly detected token"""
         try:
-            db = next(get_db())
-            try:
-                # Calculate initial tier
-                initial_tier_data = await self._calculate_initial_tier(token_data)
-                
-                # Create tier entry
-                tier = await self._create_tier_entry(db, address, initial_tier_data)
-                
-                # Queue for monitoring
-                await self.queue_token(address, priority=True)
-                
-                logger.info(f"✨ New token {address} initialized in {initial_tier_data['tier'].value} tier")
-                
-            except Exception as e:
-                logger.error(f"Error processing new token {address}: {e}")
-                raise
-            finally:
-                db.close()
+            async with get_db_session() as db:
+                try:
+                    # Calculate initial tier
+                    initial_tier_data = await self._calculate_initial_tier(token_data)
+                    
+                    # Create tier entry
+                    tier = await self._create_tier_entry(db, address, initial_tier_data)
+                    
+                    # Queue for monitoring
+                    await self.queue_token(address, priority=True)
+                    
+                    logger.info(f"✨ New token {address} initialized in {initial_tier_data['tier'].value} tier")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing new token {address}: {e}")
+                    raise
                 
         except Exception as e:
             logger.error(f"Database error processing new token {address}: {e}")
@@ -118,7 +154,7 @@ class TierProcessor:
             logger.error(f"Error calculating initial tier: {e}")
             raise
 
-    async def _create_tier_entry(self, db: Session, address: str, tier_data: Dict[str, Any]) -> TokenTier:
+    async def _create_tier_entry(self, db: AsyncSession, address: str, tier_data: Dict[str, Any]) -> TokenTier:
         """Create new tier entry in database"""
         try:
             now = datetime.utcnow()
@@ -140,12 +176,12 @@ class TierProcessor:
             )
             
             db.add(tier)
-            db.commit()
-            db.refresh(tier)
+            await db.commit()
+            await db.refresh(tier)
             return tier
             
         except SQLAlchemyError as e:
-            db.rollback()
+            await db.rollback()
             logger.error(f"Database error creating tier entry: {e}")
             raise
         except Exception as e:
@@ -201,25 +237,26 @@ class TierProcessor:
                 queue_item = await self.processing_queue.get()
                 address = queue_item['address']
                 
-                db = next(get_db())
-                try:
-                    token = db.query(MemeCoin).filter(
-                        MemeCoin.address == address
-                    ).first()
+                async with get_db_session() as db:
+                    try:
+                        # Use SQLAlchemy async
+                        result = await db.execute(
+                            select(MemeCoin).where(MemeCoin.address == address)
+                        )
+                        token = result.scalar_one_or_none()
 
-                    if token:
-                        monitoring_result = await self.tier_monitor.monitor_token(db, token)
-                        if monitoring_result:
-                            await self._handle_monitoring_result(db, token, monitoring_result)
-                            self.processed_count += 1
-                            self.last_processed = datetime.utcnow()
-                    
-                except Exception as e:
-                    logger.error(f"Error processing token {address}: {e}")
-                    self.error_count += 1
-                finally:
-                    db.close()
-                    self.processing_queue.task_done()
+                        if token:
+                            monitoring_result = await self.tier_monitor.monitor_token(db, token)
+                            if monitoring_result:
+                                await self._handle_monitoring_result(db, token, monitoring_result)
+                                self.processed_count += 1
+                                self.last_processed = datetime.utcnow()
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing token {address}: {e}")
+                        self.error_count += 1
+                    finally:
+                        self.processing_queue.task_done()
 
             except asyncio.CancelledError:
                 break
@@ -229,7 +266,7 @@ class TierProcessor:
 
     async def _handle_monitoring_result(
         self, 
-        db: Session, 
+        db: AsyncSession, 
         token: MemeCoin, 
         monitoring_result: Dict[str, Any]
     ) -> None:
@@ -267,12 +304,12 @@ class TierProcessor:
                 })
                 
                 db.add(transition)
-                db.commit()
+                await db.commit()
                 
                 logger.info(f"Token {token.address} moved from {transition.from_tier.value} to {new_tier.value}")
                 
         except Exception as e:
-            db.rollback()
+            await db.rollback()
             logger.error(f"Error handling monitoring result: {e}")
             raise
 

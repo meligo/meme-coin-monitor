@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import Enum
 from functools import wraps
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, TypeVar, Union
 
@@ -10,6 +12,10 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar('T')  # Type variable for return types
 
+class EndpointHealth(Enum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
 class RateLimitExceeded(Exception):
     """Raised when rate limit is exceeded and retry attempts fail"""
     pass
@@ -56,6 +62,38 @@ class RPCMetrics:
     def success_rate(self) -> float:
         return (self.successful_calls / self.total_calls * 100) if self.total_calls > 0 else 0.0
 
+# Add this new class after RPCMetrics class
+@dataclass
+class RPCEndpoint:
+    """RPC endpoint configuration and health tracking"""
+    url: str
+    max_rps: int
+    priority: int
+    health: EndpointHealth = EndpointHealth.HEALTHY
+    consecutive_failures: int = 0
+    last_success: Optional[datetime] = None
+    error_count: int = 0
+    success_count: int = 0
+    
+    def record_success(self):
+        self.consecutive_failures = 0
+        self.last_success = datetime.utcnow()
+        self.success_count += 1
+        self._update_health()
+        
+    def record_failure(self):
+        self.consecutive_failures += 1
+        self.error_count += 1
+        self._update_health()
+        
+    def _update_health(self):
+        if self.consecutive_failures >= 10:
+            self.health = EndpointHealth.UNHEALTHY
+        elif self.consecutive_failures >= 5:
+            self.health = EndpointHealth.DEGRADED
+        elif self.consecutive_failures == 0:
+            self.health = EndpointHealth.HEALTHY
+
 class GlobalRateLimiter:
     """
     Enhanced global rate limiter with metrics, retries, batching, and precise timing control.
@@ -77,13 +115,27 @@ class GlobalRateLimiter:
         min_delay: float = 0.001,
         max_retries: int = 10,
         base_delay: float = 0.1,
-        metric_reset_interval: int = 3600
+        metric_reset_interval: int = 3600,
+        failover_threshold: int = 5,  # New parameter
+        health_check_interval: int = 30  # New parameter
     ):
         if self._initialized:
             return
             
         self._initialized = True
-        
+        # Add this new endpoints configuration
+        self.endpoints: Dict[str, RPCEndpoint] = {
+            'primary': RPCEndpoint(
+                url=os.getenv('RPC_ENDPOINT'),
+                max_rps=max_rps,
+                priority=1
+            ),
+            'backup': RPCEndpoint(
+                url="https://solana-mainnet.core.chainstack.com/46f18fb8c176222d6731bcb9b0c1b09c",
+                max_rps=max_rps,
+                priority=2
+            )
+        }
         # Rate limiting parameters
         self.max_rps = max_rps
         self.current_second = int(time.time())
@@ -105,11 +157,40 @@ class GlobalRateLimiter:
         self.metrics = RPCMetrics()
         self.metric_reset_interval = metric_reset_interval
         self.method_metrics: Dict[str, RPCMetrics] = {}
-        
+        self.current_endpoint = 'primary'
+        self.failover_threshold = failover_threshold
+
+        # Start health check task after other initializations
+        asyncio.create_task(self._health_check_loop(health_check_interval))
         logger.info(
             f"Rate limiter initialized with: max_rps={max_rps}, "
             f"max_concurrent={max_concurrent}, max_retries={max_retries}"
         )
+
+    def get_endpoint_metrics(self) -> Dict[str, Any]:
+        """Get metrics for all endpoints"""
+        return {
+            name: {
+                "url": endpoint.url,
+                "health": endpoint.health.value,
+                "consecutive_failures": endpoint.consecutive_failures,
+                "success_count": endpoint.success_count,
+                "error_count": endpoint.error_count,
+                "success_rate": (
+                    endpoint.success_count /
+                    (endpoint.success_count + endpoint.error_count) * 100
+                    if (endpoint.success_count + endpoint.error_count) > 0
+                    else 0
+                ),
+                "last_success": (
+                    endpoint.last_success.isoformat()
+                    if endpoint.last_success
+                    else None
+                ),
+                "is_current": name == self.current_endpoint
+            }
+            for name, endpoint in self.endpoints.items()
+        }
 
     async def _wait_for_next_second(self):
         """Wait until the start of the next second with precise timing"""
@@ -137,6 +218,90 @@ class GlobalRateLimiter:
                 
             self.metrics.record_rate_limit()
             return False
+
+    async def _health_check_loop(self, interval: int):
+        """Periodically check health of endpoints"""
+        while True:
+            await asyncio.sleep(interval)
+            await self._check_endpoint_health()
+
+    async def _test_endpoint(self, endpoint: RPCEndpoint) -> bool:
+        """Test if an endpoint is responsive by making a simple RPC call"""
+        try:
+            # Create a test RPC call to get recent blockhash
+            # This will run through existing rate limiting
+            async with self.semaphore:
+                start_time = time.perf_counter()
+                # Here you would make your actual RPC call
+                # For example: await solana_client.get_recent_blockhash()
+                duration = time.perf_counter() - start_time
+                
+                # Consider failed if takes too long
+                if duration > 2.0:  # 2 second timeout
+                    logger.warning(f"Endpoint {endpoint.url} response too slow: {duration:.2f}s")
+                    return False
+                    
+                return True
+                
+        except Exception as e:
+            logger.error(f"Endpoint {endpoint.url} test failed: {str(e)}")
+            return False
+
+    async def _check_endpoint_health(self):
+        """Check health of all endpoints and manage failover"""
+        for name, endpoint in self.endpoints.items():
+            if (
+                endpoint.health != EndpointHealth.HEALTHY and 
+                name != self.current_endpoint and
+                endpoint.priority < self.endpoints[self.current_endpoint].priority
+            ):
+                if (
+                    endpoint.last_success and 
+                    (datetime.utcnow() - endpoint.last_success).total_seconds() > 300
+                ):
+                    try:
+                        # Test the endpoint
+                        result = await self._test_endpoint(endpoint)
+                        if result:
+                            logger.info(f"Failing back to {name} endpoint")
+                            self.current_endpoint = name
+                            endpoint.health = EndpointHealth.HEALTHY
+                            endpoint.consecutive_failures = 0
+                    except Exception as e:
+                        logger.warning(f"Failed health check for {name}: {str(e)}")
+
+    def _should_failover(self, current_endpoint: RPCEndpoint) -> bool:
+        """Determine if we should failover to backup endpoint"""
+        return (
+            current_endpoint.consecutive_failures >= self.failover_threshold and
+            any(
+                e.health == EndpointHealth.HEALTHY and e.priority > current_endpoint.priority
+                for e in self.endpoints.values()
+            )
+        )
+
+    async def _handle_failover(self):
+        """Handle failover to backup endpoint"""
+        current = self.endpoints[self.current_endpoint]
+        if self._should_failover(current):
+            for name, endpoint in sorted(
+                self.endpoints.items(),
+                key=lambda x: x[1].priority
+            ):
+                if (
+                    endpoint.health == EndpointHealth.HEALTHY and
+                    endpoint.priority > current.priority
+                ):
+                    logger.warning(
+                        f"Failing over from {self.current_endpoint} to {name} "
+                        f"after {current.consecutive_failures} consecutive failures"
+                    )
+                    self.current_endpoint = name
+                    break
+
+    def get_current_endpoint(self) -> RPCEndpoint:
+        """Get current RPC endpoint"""
+        return self.endpoints[self.current_endpoint]
 
     def rate_limited(self) -> Callable:
         """
@@ -193,6 +358,8 @@ class GlobalRateLimiter:
         
         async with self.semaphore:
             while True:
+                current_endpoint = self.get_current_endpoint()  # Add this
+
                 try:
                     if await self.acquire():
                         try:
@@ -202,6 +369,8 @@ class GlobalRateLimiter:
                             # Execute the call
                             start_time = time.perf_counter()
                             result = await func(*args, **kwargs)
+                            # Add this after recording success
+                            current_endpoint.record_success()
                             duration = time.perf_counter() - start_time
                             
                             # Record success
@@ -223,6 +392,8 @@ class GlobalRateLimiter:
                             return result
                             
                         except Exception as e:
+                            current_endpoint.record_failure()
+                            await self._handle_failover()
                             if attempt >= max_retries:
                                 logger.error(f"Max retries ({max_retries}) exceeded: {str(e)}")
                                 raise

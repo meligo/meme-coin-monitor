@@ -8,21 +8,23 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional  # Remove struct from typing import
 
-from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Commitment
 from solana.rpc.types import MemcmpOpts
 from solders.pubkey import Pubkey
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select, true
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
-from src.config.database import get_async_session, get_db
+from src.config.database import get_async_session, get_db, get_db_session
 from src.config.settings import settings
-from src.core.models import MemeCoin, TokenTier
-from src.core.models.meme_coin import HolderSnapshot, MemeCoin
-from src.core.models.tier_level import TierLevel
-from src.core.models.tier_models import TokenTier
-from src.core.models.wallet_analysis import WalletAnalysis
+from src.core.models import (
+    HolderSnapshot,
+    MemeCoin,
+    TierLevel,
+    TokenTier,
+    WalletAnalysis,
+)
 from src.services.analysis.rug_detector import RugDetector
 from src.services.holder_analysis.metrics_updater import HolderMetricsUpdater
 from src.services.monitoring.performance import (
@@ -32,6 +34,7 @@ from src.services.monitoring.performance import (
 from src.services.pump_fun.liquidity_checker import LiquidityChecker
 from src.services.transaction_processing.processor import TransactionProcessor
 from src.utils.rate_limiter import GlobalRateLimiter
+from src.utils.rpc_manager import RPCManager
 
 logger = logging.getLogger(__name__)
 @dataclass
@@ -55,17 +58,10 @@ class TokenMonitor:
     def __init__(self):
         self.logger = logging.getLogger(__name__)  # Initialize the logger
 
-        # Initialize RPC client with the correct endpoint
-        self.rpc_client = AsyncClient(
-            endpoint=settings['RPC_ENDPOINT'],
-            timeout=30,  # 30 seconds timeout
-            commitment=Commitment("confirmed")
-        )
-        
-        # Initialize program IDs from settings
-        self.pump_program_id = Pubkey.from_string(settings['PUMP_PROGRAM'])
-        self.token_program_id = Pubkey.from_string(settings['SYSTEM_TOKEN_PROGRAM'])
-        self.pump_global = Pubkey.from_string(settings['PUMP_GLOBAL'])
+        self.rpc_manager = RPCManager() 
+        self.pump_program_id = Pubkey.from_string(settings.pump_program)
+        self.token_program_id = Pubkey.from_string(settings.system_token_program)
+        self.pump_global = Pubkey.from_string(settings.pump_global)
         self.rate_limiter = GlobalRateLimiter()
 
         # Initialize curve discriminator
@@ -75,15 +71,21 @@ class TokenMonitor:
         self.RETRY_DELAY = 2
         # Initialize other components
         self.rug_detector = RugDetector()
-        self.liquidity_checker = LiquidityChecker(self.rpc_client)
+        self.liquidity_checker = LiquidityChecker(self.rpc_manager)
         self.is_running = False
         self.monitoring_tasks = {}
         self.task_lock = asyncio.Lock()
         self.holder_metrics_updater = HolderMetricsUpdater()
-        self.transaction_processor = TransactionProcessor(self.rpc_client)
+        self.transaction_processor = TransactionProcessor(self.rpc_manager)
+        
+    async def initialize(self):
+            """Initialize the token monitor and its dependencies"""
+            await self.rpc_manager.initialize()
+
 
     async def start_monitoring(self):
         """Start the token monitoring system"""
+        await self.initialize() 
         self.is_running = True
         asyncio.create_task(self._run_monitoring_loop())
         logger.info("Token monitoring system started")
@@ -92,10 +94,9 @@ class TokenMonitor:
         try:
             account_pubkey = Pubkey.from_string(account_address)
 
-            # Use rate limiter for RPC call
-            response = await self.rate_limiter.call(
-                self.rpc_client.get_account_info,
-                account_pubkey
+            
+            response = await self.rpc_manager.get_account_info(
+                str(account_pubkey)
             )
             
             if not response or not response.value:
@@ -153,9 +154,9 @@ class TokenMonitor:
         try:
             pubkey = Pubkey.from_string(bonding_curve_address)
             # Use rate limiter for RPC call
-            response = await self.rate_limiter.call(
-                self.rpc_client.get_account_info,
-                pubkey
+            
+            response = await self.rpc_manager.get_account_info(
+                str(pubkey)
             )
             if not response.value or not response.value.data:
                 logger.warning(f"No data found for bonding curve: {pubkey}")
@@ -269,36 +270,36 @@ class TokenMonitor:
         """Calculate 24h trading volume from on-chain transactions"""
         try:
             # Use rate limiter for RPC call
-            signatures_resp = await self.rate_limiter.call(
-                self.rpc_client.get_signatures_for_address,
+            
+            signatures_resp = await self.rpc_manager.get_signatures_for_address(
                 Pubkey.from_string(bonding_curve_address),
                 limit=1000
             )
-            
             if not signatures_resp.value:
                 return 0.0
                 
             total_volume = 0.0
             current_time = int(time.time())
             
-            # Prepare batch of transaction requests
             tx_requests = []
             for sig in signatures_resp.value:
                 if current_time - sig.block_time > 86400:  # Skip if older than 24h
                     continue
-                    
+                
                 tx_requests.append({
-                    'func': self.rpc_client.get_transaction,
+                    'method': 'get_transaction',  # Now we specify the method name as string
                     'args': [sig.signature],
                     'kwargs': {
                         'max_supported_transaction_version': 0,
                         'commitment': Commitment.CONFIRMED
                     }
                 })
-            
-            # Execute batch of transaction requests with rate limiter
-            tx_responses = await self.rate_limiter.execute_batch(tx_requests, batch_size=10)
-            
+
+            # Execute batch of transaction requests using RPCManager
+            tx_responses = await self.rpc_manager.execute_batch(
+                tx_requests,
+                batch_size=10
+            )
             # Process responses
             for tx_response in tx_responses:
                 if isinstance(tx_response, Exception):
@@ -338,18 +339,16 @@ class TokenMonitor:
     async def _run_monitoring_loop(self):
             while self.is_running:
                 try:
-                    async with get_async_session() as db:
+                    async with get_db_session() as db:
                         # Get current time and remove timezone for db comparison
-                        current_time = datetime.now(timezone.utc)
-                        current_time_naive = current_time.replace(tzinfo=None)
-                        
+                        current_time = datetime.now(timezone.utc)  # Keep timezone
                         # Query tokens due for checking
                         result = await db.execute(
                             select(TokenTier).where(
                                 and_(
                                     TokenTier.is_active.is_(True),
                                     TokenTier.is_monitoring_paused.is_(False),
-                                    TokenTier.next_check_at <= current_time_naive
+                                    TokenTier.next_check_at <= current_time
                                 )
                             )
                         )
@@ -512,7 +511,7 @@ class TokenMonitor:
         retry_count = 0
         while retry_count < self.MAX_RETRIES:
             try:
-                async with get_async_session() as db:
+                async with get_db_session() as db:
                     # Get token from database
                     result = await db.execute(
                         select(MemeCoin).where(MemeCoin.address == token_address)
@@ -574,10 +573,9 @@ class TokenMonitor:
             mint_pubkey = Pubkey.from_string(token_address)
             
             # Get largest token accounts
-            response = await self.rate_limiter.call(
-                self.rpc_client.get_token_largest_accounts,
-                mint_pubkey,
-                commitment=Commitment("confirmed")
+            response = await self.rpc_manager.get_token_largest_accounts(
+                str(mint_pubkey),
+                commitment="confirmed"
             )
             
             if not response or not response.value:
@@ -608,7 +606,7 @@ class TokenMonitor:
             logger.error(f"Error getting token holders for {token_address}: {e}")
             return []
         
-    async def _update_tier_metrics(self, token: MemeCoin, db):
+    async def _update_tier_metrics(self, token: MemeCoin, db: AsyncSession):
         """Update tier-specific metrics for the token"""
         try:
             result = await db.execute(
@@ -642,9 +640,9 @@ class TokenMonitor:
         """Calculate percentage of supply held by whale wallets"""
         try:
             # Use rate limiter for RPC call
-            response = await self.rate_limiter.call(
-                self.rpc_client.get_token_largest_accounts,
-                token_address
+            response = await self.rpc_manager.get_token_largest_accounts(
+                str(token_address),
+                commitment="confirmed"
             )
             
             if not response or not response.value:
@@ -669,14 +667,13 @@ class TokenMonitor:
     async def _calculate_smart_money_flow(self, token_address: str) -> float:
         """Calculate net flow of tokens from/to known smart money wallets"""
         try:
-            # Get recent transactions with rate limiter
-            signatures = await self.rate_limiter.call(
-                self.rpc_client.get_signatures_for_address,
-                token_address,
-                before="",  # Latest
+            # Get recent transactions using RPCManager
+            
+            signatures = await self.rpc_manager.get_signatures_for_address(
+                str(token_address),
+                before="",
                 limit=1000
             )
-            
             if not signatures.value:
                 return 0.0
 
@@ -684,12 +681,15 @@ class TokenMonitor:
             tx_requests = []
             for sig in signatures:
                 tx_requests.append({
-                    'func': self.rpc_client.get_confirmed_transaction,
+                    'method': 'get_confirmed_transaction',
                     'args': [sig.signature]
                 })
             
-            # Execute batch with rate limiter
-            tx_responses = await self.rate_limiter.execute_batch(tx_requests, batch_size=10)
+            # Execute batch using RPCManager's batch execution
+            tx_responses = await self.rpc_manager.execute_batch(
+                tx_requests,
+                batch_size=10
+            )
             
             inflow = 0.0
             outflow = 0.0
@@ -703,14 +703,20 @@ class TokenMonitor:
 
                 # Analyze pre and post token balances
                 for balance_change in tx_response.meta.pre_token_balances:
-                    if self._is_smart_money_wallet(balance_change.owner):
+                    if await self._is_smart_money_wallet(balance_change.owner):
                         pre_bal = balance_change.ui_token_amount.amount
                         post_bal = next(
                             (b.ui_token_amount.amount for b in tx_response.meta.post_token_balances 
                             if b.owner == balance_change.owner),
                             0
                         )
-                        net_flow += (post_bal - pre_bal)
+                        net_flow = post_bal - pre_bal
+                        
+                        # Update inflow/outflow based on net_flow
+                        if net_flow > 0:
+                            inflow += net_flow
+                        else:
+                            outflow += abs(net_flow)
 
             # Calculate net flow ratio
             total_volume = inflow + outflow
@@ -727,7 +733,7 @@ class TokenMonitor:
         try:
             current_holders = await self._get_current_holder_count(token_address)
             
-            async with get_async_session() as db:
+            async with get_db_session() as db:
                 day_ago = datetime.utcnow() - timedelta(days=1)
                 result = await db.execute(
                     select(HolderSnapshot).where(
@@ -800,10 +806,10 @@ class TokenMonitor:
             
     async def _get_total_supply(self, token_address: str) -> int:
         try:
-            supply_response = await self.rate_limiter.call(
-                self.rpc_client.get_token_supply,
-                token_address,
-                commitment=Commitment("confirmed")
+            
+            supply_response = await self.rpc_manager.get_token_supply(
+                str(token_address),
+                commitment="confirmed"
             )
             if not supply_response.value:
                 return 0
@@ -836,6 +842,7 @@ class TokenMonitor:
         
     async def _get_token_accounts(self, mint: Pubkey) -> List:
         """Get all token accounts for a mint"""
+        logger.info("bytes mint: %s" ,str(mint))
         try:
             memcmp = {
                 "offset": 0,
@@ -843,15 +850,14 @@ class TokenMonitor:
             }
             
             # Use rate limiter for RPC call
-            response = await self.rate_limiter.call(
-                self.rpc_client.get_program_accounts,
-                self.token_program_id,
-                filters=[
-                    {"memcmp": memcmp},
-                    {"dataSize": 165}
-                ],
+            response = await self.rpc_manager.get_program_accounts(
+                str(self.token_program_id),  # Convert Pubkey to string if needed
                 commitment="confirmed",
-                encoding="jsonParsed"
+                encoding="jsonParsed",
+                filters=[
+                    {"memcmp": {"offset": 0, "bytes": str(mint)}},
+                    {"dataSize": 165}
+                ]
             )
             
             if not response or not hasattr(response, 'value'):
@@ -867,7 +873,9 @@ class TokenMonitor:
         """Get current holder count for token"""
         try:
             mint = Pubkey.from_string(token_address)
-            accounts = await self._get_token_accounts_by_mint(mint)
+            accounts = await self._get_token_accounts(mint)
+
+
             
             if not accounts:
                 return 0
@@ -896,12 +904,12 @@ class TokenMonitor:
         try:
             # Get recent transactions
             mint = Pubkey.from_string(token_address)
-            signatures = await self.rate_limiter.call(
-                self.rpc_client.get_signatures_for_address,
-                mint,
+            signatures = await self.rpc_manager.get_signatures_for_address(
+                str(mint),
                 limit=50,
-                commitment=Commitment("confirmed")
+                commitment="confirmed"
             )
+            
             
             if not signatures.value:
                 return 0.0
@@ -910,13 +918,13 @@ class TokenMonitor:
             outflow = 0.0
             
             for sig in signatures.value:
-                tx = await self.rate_limiter.call(
-                    self.rpc_client.get_transaction,
+                tx = await self.rpc_manager.get_transaction(
                     sig.signature,
                     encoding="jsonParsed",
-                    commitment=Commitment("confirmed"),
+                    commitment="confirmed",
                     max_supported_transaction_version=0
                 )
+                
                 if not tx.value or not tx.value.meta:
                     continue
                     
@@ -1114,11 +1122,10 @@ class TokenMonitor:
         
     async def _get_current_holder_count(self, token_address: str) -> int:
         try:
-            response = await self.rate_limiter.call(
-                self.rpc_client.get_token_accounts_by_owner,
-                token_address,
-                {"programId": settings['SYSTEM_TOKEN_PROGRAM']},
-                commitment=Commitment("confirmed"),
+            response = await self.rpc_manager.get_token_accounts_by_owner(
+                str(token_address),
+                settings.system_token_program,
+                commitment="confirmed",
                 encoding="jsonParsed"
             )
             
@@ -1138,7 +1145,7 @@ class TokenMonitor:
     async def _is_smart_money_wallet(self, wallet_address: str) -> bool:
         """Check if a wallet is considered 'smart money' based on historical performance"""
         try:
-            async with get_async_session() as db:
+            async with get_db_session() as db:
                 result = await db.execute(
                     select(WalletAnalysis)
                     .where(WalletAnalysis.wallet_address == wallet_address)
@@ -1158,3 +1165,13 @@ class TokenMonitor:
         except Exception as e:
             logger.error(f"Error checking smart money wallet: {str(e)}")
             return False
+    async def get_monitoring_stats(self) -> Dict[str, Any]:
+        """Get monitoring statistics"""
+        return {
+            'active_tasks': len(self.monitoring_tasks),
+            'is_running': self.is_running,
+            'processed_tokens': sum(
+                1 for task in self.monitoring_tasks.values() 
+                if task.done() and not task.exception()
+            )
+        }

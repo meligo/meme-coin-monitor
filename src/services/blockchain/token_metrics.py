@@ -7,14 +7,15 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 from construct import Flag, Int8ul, Int64ul, Struct
-from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Commitment
 from solana.rpc.types import MemcmpOpts
 from solders.instruction import Instruction
 from solders.pubkey import Pubkey
 
+from src.config.database import db, get_db_session
 from src.config.settings import settings
 from src.utils.rate_limiter import GlobalRateLimiter
+from src.utils.rpc_manager import RPCManager
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +34,8 @@ class BondingCurveState:
         self.__dict__.update(parsed)
         
 class TokenMetrics:
-    def __init__(self, rpc_client: AsyncClient):
-        self.rpc_client = rpc_client
+    def __init__(self, rpc_manager: RPCManager):
+        self.rpc_manager = rpc_manager
         self.rate_limiter = GlobalRateLimiter()
         
     async def get_all_metrics(self, token_address: str, curve_state: Any) -> Dict[str, Any]:
@@ -50,7 +51,7 @@ class TokenMetrics:
         """
         try:
             # Get bonding curve address
-            program_id = Pubkey.from_string(settings['PUMP_PROGRAM'])
+            program_id = Pubkey.from_string(settings.pump_program)
             bonding_curve_address = self.get_associated_bonding_curve_address(
                 Pubkey.from_string(token_address),
                 program_id
@@ -98,32 +99,17 @@ class TokenMetrics:
         market_cap: Optional[float] = None,
         volume_24h: Optional[float] = None
     ) -> Dict[str, Any]:
-        """
-        Calculate smart money flow metrics - tracks sophisticated wallet movements
-        
-        Args:
-            token_address: Token's address
-            market_cap: Optional current market cap for relative size calculations
-            volume_24h: Optional 24h volume for relative size calculations
-            
-        Returns:
-            Dict containing:
-            - smart_money_flow_score: -1.0 to 1.0 indicating smart money direction
-            - whale_transactions: List of recent whale transactions
-            - smart_wallet_count: Number of smart wallets involved
-            - concentration_score: 0.0 to 1.0 indicating whale concentration
-        """
+        """Calculate smart money flow metrics - tracks sophisticated wallet movements"""
         try:
             # Config
             SMART_MONEY_THRESHOLD = 0.01  # 1% of supply or market cap
             WHALE_TRANSACTION_COUNT = 100
             
             # Get recent transactions
-            response = await self.rate_limiter.call(
-                self.rpc_client.get_signatures_for_address,
-                Pubkey.from_string(token_address),
+            response = await self.rpc_manager.get_signatures_for_address(
+                Pubkey.from_string(token_address),  # Convert Pubkey to string
                 limit=WHALE_TRANSACTION_COUNT,
-                commitment=Commitment("confirmed")
+                commitment="confirmed"
             )
             
             if not response.value:
@@ -135,24 +121,16 @@ class TokenMetrics:
             whale_txs = []
             smart_wallets = set()
             
-            # Process transactions in parallel with rate limiting
-            tx_requests = []
+            # Process transactions sequentially using RPCManager
             for sig in response.value:
-                tx_requests.append({
-                    'func': self.rpc_client.get_transaction,
-                    'args': [sig.signature],
-                    'kwargs': {
-                        'encoding': "jsonParsed",
-                        'commitment': Commitment("confirmed"),
-                        'max_supported_transaction_version': 0
-                    }
-                })
-            
-            transactions = await self.rate_limiter.execute_batch(tx_requests, batch_size=20)
-            
-            # Process each transaction
-            for tx in transactions:
-                if isinstance(tx, Exception) or not tx or not tx.value:
+                tx = await self.rpc_manager.get_transaction(
+                    sig.signature,
+                    encoding="jsonParsed",
+                    commitment="confirmed",
+                    max_supported_transaction_version=0
+                )
+                
+                if not tx or not tx.value:
                     continue
                     
                 tx_data = tx.value
@@ -246,79 +224,53 @@ class TokenMetrics:
     async def get_token_volume_24h(self, token_address: str) -> Dict[str, float]:
         """Get 24h trading volume for a token with proper pagination"""
         try:
-            # Get timestamp 24h ago
             current_time = int(time.time())
-            time_24h_ago = current_time - 86400  # 24 hours in seconds
+            time_24h_ago = current_time - 86400
             
             volume_data = {
                 "volume_usd": 0.0,
                 "transaction_count": 0
             }
             
-            # Initialize pagination variables
             all_signatures = []
             last_signature = None
             
-            # Keep fetching until we either:
-            # 1. Get all signatures within 24h
-            # 2. There are no more signatures
             while True:
-                # Use rate limiter for RPC call with proper pagination
-                response = await self.rate_limiter.call(
-                    self.rpc_client.get_signatures_for_address,
-                    Pubkey.from_string(token_address),
-                    before=last_signature,  # Use before instead of until
-                    limit=1000,  # Max limit per request
-                    commitment=Commitment("confirmed")
+                response = await self.rpc_manager.get_signatures_for_address(
+                    Pubkey.from_string(token_address),  # Convert Pubkey to string
+                    before=last_signature,
+                    limit=1000,
+                    commitment="confirmed"
                 )
                 
                 if not response.value:
                     break
                     
-                # Filter signatures within 24h window
                 current_batch = [
                     sig for sig in response.value 
                     if sig.block_time and sig.block_time >= time_24h_ago
                 ]
                 
-                # If the oldest signature is older than 24h, we're done
                 if current_batch and current_batch[-1].block_time < time_24h_ago:
                     break
                     
                 all_signatures.extend(current_batch)
                 
-                # Update last signature for next iteration
-                if len(response.value) < 1000:  # Less than max means we're done
+                if len(response.value) < 1000:
                     break
                     
                 last_signature = response.value[-1].signature
 
-            # Process found signatures in batches
-            if all_signatures:
-                # Prepare transaction requests
-                tx_requests = []
-                for sig in all_signatures:
-                    tx_requests.append({
-                        'func': self.rpc_client.get_transaction,
-                        'args': [sig.signature],
-                        'kwargs': {
-                            'encoding': "jsonParsed",
-                            'commitment': Commitment("confirmed"),
-                            'max_supported_transaction_version': 0
-                        }
-                    })
-                
-                # Execute batch requests with rate limiting
-                transactions = await self.rate_limiter.execute_batch(
-                    tx_requests, 
-                    batch_size=20
+            # Process transactions
+            for sig in all_signatures:
+                tx = await self.rpc_manager.get_transaction(
+                    sig.signature,
+                    encoding="jsonParsed",
+                    commitment="confirmed",
+                    max_supported_transaction_version=0
                 )
                 
-                # Process each transaction
-                for tx in transactions:
-                    if isinstance(tx, Exception) or not tx or not tx.value:
-                        continue
-                    
+                if tx and tx.value:
                     volume = await self._process_volume_transaction(tx.value)
                     if volume > 0:
                         volume_data["volume_usd"] += volume
@@ -340,16 +292,22 @@ class TokenMetrics:
             mint_pubkey = Pubkey.from_string(token_address)
             token_program_id = Pubkey.from_string('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')
             
-            # Create proper filter objects
+            # Log the mint address for debugging
+            logger.debug(f"Getting holder count for token: {token_address}")
+            logger.info("bytes mint_pubkey: %s" , str(mint_pubkey))
+            # Create proper filter objects - use dictionary format instead of MemcmpOpts
             filters = [
                 {"dataSize": 165},  # Token account size
                 {
-                    "memcmp": MemcmpOpts(
-                        offset=0,
-                        bytes=str(mint_pubkey)
-                    )
+                    "memcmp": {
+                        "offset": 0,
+                        "bytes": str(mint_pubkey)
+                    }
                 }
             ]
+            
+            # Log the filter structure
+            logger.debug(f"Using filters: {filters}")
             
             # Use data slice to only get balance bytes
             data_slice = {
@@ -357,26 +315,37 @@ class TokenMetrics:
                 "length": 8
             }
             
-            # Get accounts with rate limiting
-            response = await self.rate_limiter.call(
-                self.rpc_client.get_program_accounts,
-                token_program_id,
-                commitment=Commitment("confirmed"),
-                encoding="base64",
-                filters=filters,
-                data_slice=data_slice
-            )
-            
+            # Get accounts with rate limiting and debug logging
+            try:
+                logger.debug("Making RPC call to get_program_accounts...")
+                response = await self.rpc_manager.get_program_accounts(
+                    str(token_program_id),  # Convert Pubkey to string if needed
+                    commitment="confirmed",
+                    encoding="base64",
+                    filters=filters,
+                    data_slice=data_slice
+                )
+                logger.debug(f"RPC response received with {len(response.value) if response.value else 0} accounts")
+                
+            except Exception as e:
+                logger.error(f"RPC call failed: {str(e)}")
+                raise
+                
             if not response.value:
                 return 0
                 
             # Count non-zero balances
             holder_count = 0
             for acc in response.value:
-                balance = int.from_bytes(base64.b64decode(acc.account.data[0]), 'little')
-                if balance > 0:
-                    holder_count += 1
+                try:
+                    balance = int.from_bytes(base64.b64decode(acc.account.data[0]), 'little')
+                    if balance > 0:
+                        holder_count += 1
+                except Exception as e:
+                    logger.error(f"Error processing account balance: {str(e)}")
+                    continue
                     
+            logger.debug(f"Found {holder_count} holders for token {token_address}")
             return holder_count
 
         except Exception as e:
@@ -541,9 +510,8 @@ class TokenMetrics:
                 
             # Get wallet info with rate limiting
             wallet = tx.message.account_keys[0]
-            account = await self.rate_limiter.call(
-                self.rpc_client.get_account_info,
-                wallet
+            account = await self.rpc_manager.get_account_info(
+                str(wallet)  # Convert Pubkey to string if needed
             )
             
             if not account.value:
@@ -555,9 +523,8 @@ class TokenMetrics:
                 return False
                 
             # - Check transaction history with rate limiting
-            signatures = await self.rate_limiter.call(
-                self.rpc_client.get_signatures_for_address,
-                wallet,
+            signatures = await self.rpc_manager.get_signatures_for_address(
+                str(wallet),  # Convert Pubkey to string if needed
                 limit=10
             )
             

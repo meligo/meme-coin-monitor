@@ -1,121 +1,146 @@
 import base64
 import os
-from functools import lru_cache
-from typing import Any, Dict
-
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
-from pydantic import BaseModel
 
 # Load environment variables
 load_dotenv()
 
-class Settings(BaseModel):
-    """Application settings loaded from environment variables"""
-    
-    # Program IDs and Important Addresses
-    PUMP_PROGRAM: str
-    PUMP_GLOBAL: str
-    PUMP_EVENT_AUTHORITY: str
-    PUMP_FEE: str
-    TOKEN_METADATA_PROGRAM_ID: str
+@dataclass
+class RPCEndpoint:
+    url: str
+    priority: int = 1
+    weight: float = 1.0
+    is_healthy: bool = True
 
-    # Solana System Programs
-    SYSTEM_PROGRAM: str
-    SYSTEM_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM: str
-    SYSTEM_TOKEN_PROGRAM: str
-    RPC_ENDPOINT: str
-
-    # Account Discriminators
-    TOKEN_DISCRIMINATOR: str
-    CURVE_DISCRIMINATOR: str
-
-    # Constants
-    LAMPORTS_PER_SOL: int
-    TOKEN_DECIMALS: int
-    
-    # Database Configuration
-    DATABASE_URL: str
-
-    # Monitoring Configuration
-    CHECK_INTERVAL: int
-    BATCH_SIZE: int
-    SIGNAL_TIER_INTERVAL: int
-    HOT_TIER_INTERVAL: int
-    WARM_TIER_INTERVAL: int 
-    COLD_TIER_INTERVAL: int
-
-    # Logging Configuration
-    LOG_LEVEL: str
-    LOG_FORMAT: str
-
-    # Alert Configuration
-    ALERT_WEBHOOK_URL: str
-    ALERT_MIN_SEVERITY: str
-
-    # Resource Limits
-    MAX_WORKERS: int
-    MAX_MEMORY_USAGE: int
-    CACHE_TTL: int
-
-    # Redis Configuration
-    REDIS_HOST: str
-    REDIS_PORT: int
-    REDIS_DB: int
-
-    # Backtesting Configuration
-    ENABLE_BACKTESTING: bool
-    BACKTEST_START_DATE: str
-    BACKTEST_END_DATE: str
-    BACKTEST_BATCH_SIZE: int
-
-    @property
-    def token_discriminator_bytes(self) -> bytes:
-        return base64.b64decode(self.TOKEN_DISCRIMINATOR)
-
-    @property
-    def curve_discriminator_bytes(self) -> bytes:
-        return base64.b64decode(self.CURVE_DISCRIMINATOR)
-
-    @property
-    def tier_intervals(self) -> Dict[str, int]:
+    def to_dict(self) -> Dict:
         return {
-            "signal": self.SIGNAL_TIER_INTERVAL,
-            "hot": self.HOT_TIER_INTERVAL,
-            "warm": self.WARM_TIER_INTERVAL,
-            "cold": self.COLD_TIER_INTERVAL
+            "url": self.url,
+            "priority": self.priority,
+            "weight": self.weight
         }
 
+class Settings:
+    def __init__(self):
+        self._validate_required_env_vars()
+        self._load_settings()
 
-def get_settings():
-    env_settings = {}
-    for key, value in os.environ.items():
-        if key in ['CHECK_INTERVAL', 'BATCH_SIZE', 'SIGNAL_TIER_INTERVAL',
-                   'HOT_TIER_INTERVAL', 'WARM_TIER_INTERVAL', 'COLD_TIER_INTERVAL',
-                   'MAX_WORKERS', 'MAX_MEMORY_USAGE', 'CACHE_TTL']:
-            env_settings[key] = int(value)
-        elif key in ['ENABLE_BACKTESTING']:
-            env_settings[key] = value.lower() in ['true', '1', 'yes']
-        elif key in ['BACKTEST_START_DATE', 'BACKTEST_END_DATE']:
-            from datetime import datetime
-            env_settings[key] = datetime.strptime(value, '%Y-%m-%d')
-        else:
-            env_settings[key] = value  # Keep as string by default
-    return env_settings
+    def _validate_required_env_vars(self):
+        """Validate that all required environment variables are present"""
+        required_vars = [
+            'PUMP_PROGRAM',
+            'PUMP_GLOBAL',
+            'PUMP_EVENT_AUTHORITY',
+            'PUMP_FEE',
+            'TOKEN_METADATA_PROGRAM_ID',
+            'DATABASE_URL',
+            'RPC_ENDPOINT'
+        ]
 
-# Create settings instance
-settings = get_settings()
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
+        if missing_vars:
+            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
 
-# Export constants for backward compatibility
-PUMP_PROGRAM = settings['PUMP_PROGRAM']
-PUMP_GLOBAL = settings['PUMP_GLOBAL']
-PUMP_EVENT_AUTHORITY = settings['PUMP_EVENT_AUTHORITY']
-PUMP_FEE = settings['PUMP_FEE']
-TOKEN_METADATA_PROGRAM_ID = settings['TOKEN_METADATA_PROGRAM_ID']
-SYSTEM_PROGRAM = settings['SYSTEM_PROGRAM']
-SYSTEM_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM = settings['SYSTEM_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM']
-SYSTEM_TOKEN_PROGRAM = settings['SYSTEM_TOKEN_PROGRAM']
-RPC_ENDPOINT = settings['RPC_ENDPOINT']
-TOKEN_DISCRIMINATOR = settings['TOKEN_DISCRIMINATOR']
-CURVE_DISCRIMINATOR = settings['CURVE_DISCRIMINATOR']
-LAMPORTS_PER_SOL = settings['LAMPORTS_PER_SOL']
-TOKEN_DECIMALS = settings['TOKEN_DECIMALS'] 
+    def _load_settings(self):
+        """Load and process all settings from environment variables"""
+        # RPC Configuration
+        self.rpc_endpoints: List[RPCEndpoint] = [
+            RPCEndpoint(url=os.getenv('RPC_ENDPOINT'))
+        ]
+        if backup_rpc := os.getenv('BACKUP_RPC_ENDPOINT'):
+            self.rpc_endpoints.append(RPCEndpoint(
+                url=backup_rpc,
+                priority=2,
+                weight=0.5
+            ))
+
+        self.rpc_config = {
+            "endpoints": [endpoint.to_dict() for endpoint in self.rpc_endpoints],
+            "health_check_interval": int(os.getenv('RPC_HEALTH_CHECK_INTERVAL', '60')),
+            "error_threshold": int(os.getenv('RPC_ERROR_THRESHOLD', '5')),
+            "max_retries": int(os.getenv('RPC_MAX_RETRIES', '3')),
+            "retry_delay": float(os.getenv('RPC_RETRY_DELAY', '1.0')),
+        }
+
+        # Program IDs and Important Addresses
+        self.pump_program: str = os.getenv('PUMP_PROGRAM', '')
+        self.pump_global: str = os.getenv('PUMP_GLOBAL', '')
+        self.pump_event_authority: str = os.getenv('PUMP_EVENT_AUTHORITY', '')
+        self.pump_fee: str = os.getenv('PUMP_FEE', '')
+        self.token_metadata_program_id: str = os.getenv('TOKEN_METADATA_PROGRAM_ID', '')
+
+        # System Programs
+        self.system_program: str = os.getenv('SYSTEM_PROGRAM', '')
+        self.system_associated_token_account_program: str = os.getenv('SYSTEM_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM', '')
+        self.system_token_program: str = os.getenv('SYSTEM_TOKEN_PROGRAM', '')
+
+        # Account Discriminators
+        self.token_discriminator: Optional[str] = os.getenv('TOKEN_DISCRIMINATOR')
+        self.curve_discriminator: Optional[str] = os.getenv('CURVE_DISCRIMINATOR')
+        self.token_discriminator_bytes: Optional[bytes] = (
+            base64.b64decode(self.token_discriminator) if self.token_discriminator else None
+        )
+        self.curve_discriminator_bytes: Optional[bytes] = (
+            base64.b64decode(self.curve_discriminator) if self.curve_discriminator else None
+        )
+
+        # Constants
+        self.lamports_per_sol: int = int(os.getenv('LAMPORTS_PER_SOL', '1000000000'))
+        self.token_decimals: int = int(os.getenv('TOKEN_DECIMALS', '6'))
+
+        # Database Configuration
+        self.database_url: str = os.getenv('DATABASE_URL', '')
+
+        # Monitoring Configuration
+        self.check_interval: int = int(os.getenv('CHECK_INTERVAL', '60'))
+        self.batch_size: int = int(os.getenv('BATCH_SIZE', '100'))
+        self.signal_tier_interval: int = int(os.getenv('SIGNAL_TIER_INTERVAL', '30'))
+        self.hot_tier_interval: int = int(os.getenv('HOT_TIER_INTERVAL', '300'))
+        self.warm_tier_interval: int = int(os.getenv('WARM_TIER_INTERVAL', '1800'))
+        self.cold_tier_interval: int = int(os.getenv('COLD_TIER_INTERVAL', '21600'))
+
+        # Logging Configuration
+        self.log_level: str = os.getenv('LOG_LEVEL', 'INFO')
+        self.log_format: str = os.getenv('LOG_FORMAT', '%(asctime)s - %(levelname)s - [%(name)s] %(message)s')
+
+        # Alert Configuration
+        self.alert_webhook_url: Optional[str] = os.getenv('ALERT_WEBHOOK_URL')
+        self.alert_min_severity: str = os.getenv('ALERT_MIN_SEVERITY', 'WARNING')
+
+        # Resource Limits
+        self.max_workers: int = int(os.getenv('MAX_WORKERS', '10'))
+        self.max_memory_usage: int = int(os.getenv('MAX_MEMORY_USAGE', '4096'))
+        self.cache_ttl: int = int(os.getenv('CACHE_TTL', '3600'))
+
+        # Redis Configuration
+        self.redis_host: Optional[str] = os.getenv('REDIS_HOST')
+        self.redis_port: int = int(os.getenv('REDIS_PORT', '6379'))
+        self.redis_db: int = int(os.getenv('REDIS_DB', '0'))
+
+        # Backtesting Configuration
+        self.enable_backtesting: bool = str(os.getenv('ENABLE_BACKTESTING', 'false')).lower() == 'true'
+        self.backtest_start_date: Optional[str] = os.getenv('BACKTEST_START_DATE')
+        self.backtest_end_date: Optional[str] = os.getenv('BACKTEST_END_DATE')
+        self.backtest_batch_size: int = int(os.getenv('BACKTEST_BATCH_SIZE', '100'))
+
+    def __getitem__(self, key: str) -> any:
+        """Allow dictionary-style access for backward compatibility"""
+        return getattr(self, key.lower())
+
+# Create global settings instance
+settings = Settings()
+
+# For backward compatibility and type hints
+PUMP_PROGRAM: str = settings.pump_program
+PUMP_GLOBAL: str = settings.pump_global
+PUMP_EVENT_AUTHORITY: str = settings.pump_event_authority
+PUMP_FEE: str = settings.pump_fee
+TOKEN_METADATA_PROGRAM_ID: str = settings.token_metadata_program_id
+SYSTEM_PROGRAM: str = settings.system_program
+SYSTEM_ASSOCIATED_TOKEN_ACCOUNT_PROGRAM: str = settings.system_associated_token_account_program
+SYSTEM_TOKEN_PROGRAM: str = settings.system_token_program
+TOKEN_DISCRIMINATOR: Optional[str] = settings.token_discriminator
+CURVE_DISCRIMINATOR: Optional[str] = settings.curve_discriminator
+LAMPORTS_PER_SOL: int = settings.lamports_per_sol
+TOKEN_DECIMALS: int = settings.token_decimals

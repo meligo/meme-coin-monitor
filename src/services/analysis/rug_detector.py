@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple
 from solana.rpc.commitment import Commitment
 from solders.pubkey import Pubkey
 
+from src.utils.rpc_manager import RPCManager
+
 logger = logging.getLogger(__name__)
 
 class RugPullRisk(Enum):
@@ -17,6 +19,8 @@ class RugPullRisk(Enum):
 
 class RugDetector:
     def __init__(self):
+        self.rpc_manager = RPCManager()  # Create RPC manager
+
         # Thresholds for different metrics
         self.thresholds = {
             'liquidity': {
@@ -247,9 +251,9 @@ class RugDetector:
             
             # Get recent transactions
             try:
-                signatures = await self.rpc_client.get_signatures_for_address(
-                    Pubkey.from_string(token_address),
-                    limit=100,  # Last 100 transactions
+                signatures = await self.rpc_manager.get_signatures_for_address(
+                    str(token_address),  # Convert Pubkey to string
+                    limit=100,
                     commitment="confirmed"
                 )
                 
@@ -279,11 +283,10 @@ class RugDetector:
                             continue
 
 
-                    tx = await self.rate_limiter.call(
-                        self.rpc_client.get_transaction,
+                    tx = await self.rpc_manager.get_transaction(
                         sig.signature,
                         encoding="jsonParsed",
-                        commitment=Commitment("confirmed"),
+                        commitment="confirmed",
                         max_supported_transaction_version=0
                     )
                     

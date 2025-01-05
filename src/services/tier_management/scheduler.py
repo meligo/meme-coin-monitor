@@ -1,12 +1,13 @@
-import logging
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
 
-from src.core.models.tier_models import TokenTier
+from sqlalchemy import and_, or_, select
+from sqlalchemy.orm import Session
+
 from src.core.models.tier_level import TierLevel
+from src.core.models.tier_models import TokenTier
 from src.services.tier_management.monitoring import TierMonitor
 
 logger = logging.getLogger(__name__)
@@ -41,10 +42,13 @@ class TierScheduler:
         """Schedule monitoring for all active tokens"""
         try:
             # Get all active token tiers
-            active_tiers = db.query(TokenTier).filter(
-                TokenTier.is_active == True,
-                TokenTier.is_monitoring_paused == False
-            ).all()
+            result = await db.execute(
+                select(TokenTier).where(
+                    TokenTier.is_active == True,
+                    TokenTier.is_monitoring_paused == False
+                )
+            )
+            active_tiers = result.scalars().all()
 
             for tier in active_tiers:
                 await self.schedule_token(db, tier)
@@ -100,7 +104,7 @@ class TierScheduler:
         while True:
             try:
                 # Check if monitoring should still be active
-                db.refresh(tier)
+                await db.refresh(tier)
                 if not tier.is_active or tier.is_monitoring_paused:
                     logger.info(f"Stopping monitoring for inactive token {tier.token_address}")
                     break
@@ -116,7 +120,7 @@ class TierScheduler:
                 # Update next check time
                 tier.last_checked = datetime.utcnow()
                 tier.next_check_at = tier.last_checked + timedelta(seconds=interval)
-                db.commit()
+                await db.commit()
 
                 # Sleep until next check
                 await asyncio.sleep(interval)

@@ -1,10 +1,12 @@
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
+
 from src.services.blockchain.token_metrics import TokenMetrics
+from src.utils.rpc_manager import RPCManager
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +23,10 @@ class WalletMetrics:
     related_wallets: Set[str]
 
 class WalletPatternAnalyzer:
-    def __init__(self, rpc_client):
-        self.token_metrics = TokenMetrics(rpc_client)
+    def __init__(self, rpc_manager: RPCManager):
+        self.rpc_manager = rpc_manager
+
+        self.token_metrics = TokenMetrics(self.rpc_manager)
         self.suspicious_patterns = {
             'early_entry': {
                 'max_mcap': 50000,  # $50k market cap threshold

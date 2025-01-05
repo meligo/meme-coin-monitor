@@ -350,7 +350,7 @@ class TierMonitor:
                 metrics=monitoring_result['analysis']
             )
             db.add(alert)
-            db.commit()
+            await db.commit()
             
         except Exception as e:
             logger.error(f"Error creating alert: {e}")

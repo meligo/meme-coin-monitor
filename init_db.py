@@ -1,6 +1,6 @@
+import logging
 import os
 import sys
-import logging
 from traceback import format_exc
 
 from sqlalchemy import MetaData, create_engine, inspect, text
@@ -60,10 +60,10 @@ def verify_model_relationships():
 
 def init_database():
     """Initialize the database with all tables and constraints"""
-    logger.info(f"Database URL: {settings['DATABASE_URL']}")
+    logger.info(f"Database URL: {settings.database_url}")
     logger.info("\nInitializing database...")
     
-    engine = create_engine(settings['DATABASE_URL'])
+    engine = create_engine(settings.database_url)
     
     # Create database if it doesn't exist
     if not database_exists(engine.url):
